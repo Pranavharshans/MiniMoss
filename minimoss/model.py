@@ -307,14 +307,12 @@ class MiniMossModel(nn.Module):
         group_embs = self._get_group_embeddings(audio_codes)  # list of [B, T_audio, D_local]
 
         # 5. Build local decoder input sequence per frame:
-        #    [h_t, emb(g0), emb(g1), emb(g2)] -> predict [g0, g1, g2, g3]
-        #    Frame dimensions become batch: [B*T_audio, 1+n_groups-1, D_local]
-        frame_h_flat = frame_h.reshape(B * T_audio, 1, self.config.local_hidden_size)
-        g0_flat = group_embs[0].reshape(B * T_audio, 1, self.config.local_hidden_size)
-        g1_flat = group_embs[1].reshape(B * T_audio, 1, self.config.local_hidden_size)
-        g2_flat = group_embs[2].reshape(B * T_audio, 1, self.config.local_hidden_size)
-
-        decoder_input = torch.cat([frame_h_flat, g0_flat, g1_flat, g2_flat], dim=1)
+        #    [h_t] + group_embs[:-1] -> predict groups 0..n_groups-1
+        #    Frame dimensions become batch: [B*T_audio, n_groups, D_local]
+        input_parts = [frame_h.reshape(B * T_audio, 1, self.config.local_hidden_size)]
+        for g_emb in group_embs[:-1]:
+            input_parts.append(g_emb.reshape(B * T_audio, 1, self.config.local_hidden_size))
+        decoder_input = torch.cat(input_parts, dim=1)
         # [B*T_audio, n_groups, D_local]
 
         # 6. Run local decoder (causal)
