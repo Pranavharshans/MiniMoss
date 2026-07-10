@@ -217,3 +217,52 @@ teacher and ground-truth files when a free output fails. A successful gate has
 recognizable held-out target speech in teacher mode and at least partially
 stable target speech in free-running mode. Exact validation RVQ accuracy is a
 diagnostic, not a perceptual quality score.
+
+## V2 Alignment Gate
+
+Use this experiment when the fully frozen Qwen run memorizes training audio but
+held-out validation remains near random. V2 keeps the grouped local decoder and
+MOSS codec unchanged, while enabling two targeted alignment changes:
+
+- Rank-8 LoRA updates on Qwen Q/K/V/O attention projections. Qwen base weights
+  remain frozen and are not stored in MiniMoss checkpoints.
+- A nonlinear conditioner that concatenates all 32 RVQ embeddings, mixes them
+  with an MLP, normalizes them, and matches their scale to Qwen text embeddings.
+
+Run V2 from scratch in a new output directory. Do not resume a V1 checkpoint:
+
+```bash
+python -u -m minimoss.train_overfit \
+  --manifest data_ljspeech_1100/train_manifest.jsonl \
+  --validation-manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir checkpoints/ljspeech_1000_v2 \
+  --batch-size 4 \
+  --max-steps 5000 \
+  --validate-every 250 \
+  --qwen-lora \
+  --qwen-lora-rank 8 \
+  --qwen-lora-alpha 16 \
+  --nonlinear-frame-conditioner \
+  --text-diagnostics \
+  --early-stopping-patience 4 \
+  --device cuda 2>&1 | tee logs/train_ljspeech_1000_v2.log
+```
+
+The text diagnostic compares normal validation loss with validation after
+reversing text assignments within each batch. A positive and growing `delta`
+indicates that predictions depend on the correct text. A near-zero delta means
+the model is still ignoring text. Early stopping ends the run after four
+validation checks without a new best loss.
+
+Evaluate the best V2 checkpoint:
+
+```bash
+python -u -m minimoss.evaluate \
+  --checkpoint checkpoints/ljspeech_1000_v2/best_validation.pt \
+  --manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir evaluation/ljspeech_validation_v2 \
+  --limit 20 \
+  --device cuda 2>&1 | tee logs/evaluate_ljspeech_validation_v2.log
+```

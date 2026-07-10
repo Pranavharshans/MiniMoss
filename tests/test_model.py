@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from minimoss.config import MiniMossConfig
-from minimoss.model import LocalRMSNorm, MiniMossModel
+from minimoss.model import LoRALinear, LocalRMSNorm, MiniMossModel, add_lora_adapters
 
 
 class FakeBackbone(nn.Module):
@@ -82,6 +82,36 @@ def test_frame_conditioning_is_shifted_without_target_leakage():
 
     assert torch.allclose(hidden_a[:, 2], hidden_b[:, 2])
     assert not torch.allclose(hidden_a[:, 3], hidden_b[:, 3])
+
+
+def test_nonlinear_frame_conditioner_preserves_causal_shift():
+    torch.manual_seed(4)
+    config = tiny_config()
+    config.use_nonlinear_frame_conditioner = True
+    model = MiniMossModel(config)
+    model._backbone = FakeBackbone(vocab_size=32, hidden_size=12)
+    model._backbone.requires_grad_(False)
+    audio_a = torch.randint(0, 16, (1, 4, 8))
+    audio_b = audio_a.clone()
+    audio_b[:, 2] = (audio_b[:, 2] + 1) % 16
+
+    hidden_a = model.encode_frames(torch.tensor([[1, 2]]), audio_a)
+    hidden_b = model.encode_frames(torch.tensor([[1, 2]]), audio_b)
+
+    assert torch.allclose(hidden_a[:, 2], hidden_b[:, 2])
+    assert not torch.allclose(hidden_a[:, 3], hidden_b[:, 3])
+
+
+def test_lora_adapter_trains_only_low_rank_update():
+    module = nn.Module()
+    module.q_proj = nn.Linear(12, 12, bias=False)
+    replaced = add_lora_adapters(module, {"q_proj"}, rank=2, alpha=4.0, dropout=0.0)
+
+    assert replaced == 1
+    assert isinstance(module.q_proj, LoRALinear)
+    assert not module.q_proj.base.weight.requires_grad
+    assert module.q_proj.lora_a.weight.requires_grad
+    assert module.q_proj.lora_b.weight.requires_grad
 
 
 def test_tiny_batch_loss_decreases():

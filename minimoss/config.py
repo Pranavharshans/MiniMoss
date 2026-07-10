@@ -6,6 +6,11 @@ class MiniMossConfig:
     # Backbone
     backbone_name: str = "Qwen/Qwen2.5-0.5B"
     backbone_hidden_size: int = 896  # Qwen2.5-0.5B hidden dim
+    use_qwen_lora: bool = False
+    qwen_lora_rank: int = 8
+    qwen_lora_alpha: float = 16.0
+    qwen_lora_dropout: float = 0.0
+    qwen_lora_targets: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
 
     # Audio tokenizer / codec
     # MOSS-Audio-Tokenizer uses 32 RVQ layers, codebook size 1024, and 12.5 fps
@@ -14,6 +19,7 @@ class MiniMossConfig:
     codec_sample_rate: int = 24000
     n_codebooks: int = 32
     codebook_size: int = 1024
+    use_nonlinear_frame_conditioner: bool = False
 
     # Grouped local decoder
     n_groups: int = 8
@@ -61,6 +67,8 @@ class MiniMossConfig:
             raise ValueError("codebook_size must be positive")
         if self.max_frames <= 0:
             raise ValueError("max_frames must be positive")
+        if self.qwen_lora_rank <= 0:
+            raise ValueError("qwen_lora_rank must be positive")
 
     @property
     def local_head_dim(self) -> int:

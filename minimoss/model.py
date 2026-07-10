@@ -56,6 +56,36 @@ class LocalRMSNorm(nn.Module):
         return x * torch.rsqrt(norm + self.eps) * self.weight
 
 
+class LoRALinear(nn.Module):
+    """Frozen linear layer with a trainable low-rank residual update."""
+
+    def __init__(self, base: nn.Linear, rank: int, alpha: float, dropout: float):
+        super().__init__()
+        self.base = base
+        self.base.requires_grad_(False)
+        self.lora_a = nn.Linear(base.in_features, rank, bias=False)
+        self.lora_b = nn.Linear(rank, base.out_features, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.scaling = alpha / rank
+        nn.init.kaiming_uniform_(self.lora_a.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_b.weight)
+
+    def forward(self, x):
+        return self.base(x) + self.lora_b(self.lora_a(self.dropout(x))) * self.scaling
+
+
+def add_lora_adapters(module: nn.Module, targets, rank: int, alpha: float, dropout: float):
+    """Replace matching linear children recursively and return replacement count."""
+    replaced = 0
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear) and name in targets:
+            setattr(module, name, LoRALinear(child, rank, alpha, dropout))
+            replaced += 1
+        else:
+            replaced += add_lora_adapters(child, targets, rank, alpha, dropout)
+    return replaced
+
+
 class LocalAttention(nn.Module):
     def __init__(self, config: MiniMossConfig):
         super().__init__()
@@ -167,6 +197,16 @@ class MiniMossModel(nn.Module):
         self.frame_to_backbone = nn.Linear(
             config.local_hidden_size, config.backbone_hidden_size, bias=False
         )
+        self.frame_conditioner = None
+        if getattr(config, "use_nonlinear_frame_conditioner", False):
+            self.frame_conditioner = nn.Sequential(
+                nn.Linear(
+                    config.n_codebooks * config.local_hidden_size,
+                    config.local_hidden_size,
+                ),
+                nn.GELU(),
+                nn.Linear(config.local_hidden_size, config.backbone_hidden_size),
+            )
 
         # Local decoder
         self.local_decoder = LocalTransformer(config)
@@ -202,6 +242,22 @@ class MiniMossModel(nn.Module):
             )
             for p in self._backbone.parameters():
                 p.requires_grad = False
+            if getattr(self.config, "use_qwen_lora", False):
+                replaced = add_lora_adapters(
+                    self._backbone,
+                    set(getattr(
+                        self.config,
+                        "qwen_lora_targets",
+                        ("q_proj", "k_proj", "v_proj", "o_proj"),
+                    )),
+                    getattr(self.config, "qwen_lora_rank", 8),
+                    getattr(self.config, "qwen_lora_alpha", 16.0),
+                    getattr(self.config, "qwen_lora_dropout", 0.0),
+                )
+                if replaced == 0:
+                    raise RuntimeError(
+                        "No Qwen LoRA attention projection targets were found"
+                    )
             self._backbone.eval()
         return self._backbone
 
@@ -211,9 +267,15 @@ class MiniMossModel(nn.Module):
 
     def _embed_audio_frames(self, audio_codes: torch.LongTensor) -> torch.Tensor:
         """Summarize every RVQ frame into the local hidden space."""
+        embeddings = [
+            embedding(audio_codes[:, :, cb])
+            for cb, embedding in enumerate(self.codebook_embeddings)
+        ]
+        if self.frame_conditioner is not None:
+            return self.frame_conditioner(torch.cat(embeddings, dim=-1))
         frame_embedding = 0
-        for cb, embedding in enumerate(self.codebook_embeddings):
-            frame_embedding = frame_embedding + embedding(audio_codes[:, :, cb])
+        for embedding in embeddings:
+            frame_embedding = frame_embedding + embedding
         return frame_embedding / self.config.n_codebooks
 
     def encode_frames(
@@ -242,11 +304,26 @@ class MiniMossModel(nn.Module):
             text_embeds = text_embedding_layer(text_tokens)
 
         frame_summaries = self._embed_audio_frames(audio_codes)
-        shifted_frames = torch.empty_like(frame_summaries)
-        shifted_frames[:, 0] = self.frame_start
-        if T_audio > 1:
-            shifted_frames[:, 1:] = frame_summaries[:, :-1]
-        frame_inputs = self.frame_to_backbone(shifted_frames)
+        if self.frame_conditioner is None:
+            shifted_frames = torch.empty_like(frame_summaries)
+            shifted_frames[:, 0] = self.frame_start
+            if T_audio > 1:
+                shifted_frames[:, 1:] = frame_summaries[:, :-1]
+            frame_inputs = self.frame_to_backbone(shifted_frames)
+        else:
+            frame_inputs = torch.empty(
+                (B, T_audio, self.config.backbone_hidden_size),
+                device=frame_summaries.device,
+                dtype=frame_summaries.dtype,
+            )
+            frame_inputs[:, 0] = self.frame_to_backbone(self.frame_start)
+            if T_audio > 1:
+                frame_inputs[:, 1:] = frame_summaries[:, :-1]
+            frame_inputs = F.layer_norm(
+                frame_inputs, (self.config.backbone_hidden_size,)
+            )
+            text_scale = text_embeds.detach().float().std().clamp_min(1e-6)
+            frame_inputs = frame_inputs * text_scale.to(frame_inputs.dtype)
 
         if text_attention_mask is None:
             text_attention_mask = torch.ones_like(text_tokens, dtype=torch.long)

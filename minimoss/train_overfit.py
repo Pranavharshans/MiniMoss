@@ -29,7 +29,14 @@ def weighted_loss(group_losses, weights):
 
 def trainable_state_dict(model):
     """Return a checkpoint without duplicating the frozen Hugging Face backbone."""
-    return {key: value for key, value in model.state_dict().items() if not key.startswith("_backbone.")}
+    trainable_names = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    return {
+        key: value
+        for key, value in model.state_dict().items()
+        if not key.startswith("_backbone.") or key in trainable_names
+    }
 
 
 def save_checkpoint(path, step, model, optimizer, scaler, config, best_validation_loss):
@@ -44,12 +51,16 @@ def save_checkpoint(path, step, model, optimizer, scaler, config, best_validatio
 
 
 @torch.inference_mode()
-def validate(model, loader, device, weights, max_batches=None):
+def validate(model, loader, device, weights, max_batches=None, shuffle_text=False):
     model.eval()
     total_loss = 0.0
     total_groups = [0.0] * len(weights)
     batches = 0
     for text, text_mask, rvq, audio_mask in loader:
+        if shuffle_text:
+            permutation = torch.arange(text.shape[0] - 1, -1, -1)
+            text = text[permutation]
+            text_mask = text_mask[permutation]
         text = text.to(device)
         text_mask = text_mask.to(device)
         rvq = rvq.to(device)
@@ -85,6 +96,14 @@ def main():
     parser.add_argument("--validation-batches", type=int, default=None,
                         help="Limit validation batches; default evaluates the full manifest")
     parser.add_argument("--resume", default=None, help="Resume from a training checkpoint")
+    parser.add_argument("--qwen-lora", action="store_true")
+    parser.add_argument("--qwen-lora-rank", type=int, default=8)
+    parser.add_argument("--qwen-lora-alpha", type=float, default=16.0)
+    parser.add_argument("--nonlinear-frame-conditioner", action="store_true")
+    parser.add_argument("--text-diagnostics", action="store_true",
+                        help="Also validate with text reversed across each batch")
+    parser.add_argument("--early-stopping-patience", type=int, default=None,
+                        help="Stop after this many validation checks without improvement")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--codec", default="OpenMOSS-Team/MOSS-Audio-Tokenizer",
@@ -111,6 +130,10 @@ def main():
         manifest_path=args.manifest,
         token_dir=args.token_dir,
         use_amp=not args.no_amp,
+        use_qwen_lora=args.qwen_lora,
+        qwen_lora_rank=args.qwen_lora_rank,
+        qwen_lora_alpha=args.qwen_lora_alpha,
+        use_nonlinear_frame_conditioner=args.nonlinear_frame_conditioner,
     )
     if args.max_steps is not None:
         config.max_steps = args.max_steps
@@ -118,6 +141,8 @@ def main():
         raise ValueError("--validate-every must be positive")
     if args.validation_batches is not None and args.validation_batches <= 0:
         raise ValueError("--validation-batches must be positive")
+    if args.early_stopping_patience is not None and args.early_stopping_patience <= 0:
+        raise ValueError("--early-stopping-patience must be positive")
 
     print("=" * 60)
     print("MiniMoss Overfit Training")
@@ -128,12 +153,15 @@ def main():
     print(f"  local hidden: {config.local_hidden_size}")
     print(f"  n_codebooks: {config.n_codebooks}")
     print(f"  n_groups: {config.n_groups}")
-    print("  qwen: frozen")
+    qwen_status = "frozen base + trainable LoRA" if config.use_qwen_lora else "frozen"
+    print(f"  qwen: {qwen_status}")
     print("  trainable: frame conditioner + projection + RVQ embeddings + local decoder + heads")
     print(f"  device: {args.device}")
     print(f"  overfit_one_batch: {args.overfit_one_batch}")
     print(f"  validation_manifest: {args.validation_manifest}")
     print(f"  resume: {args.resume}")
+    print(f"  qwen_lora: {config.use_qwen_lora} (rank={config.qwen_lora_rank})")
+    print(f"  nonlinear_frame_conditioner: {config.use_nonlinear_frame_conditioner}")
 
     # Dataset
     dataset = MiniMossDataset(
@@ -189,6 +217,7 @@ def main():
 
     start_step = 0
     best_validation_loss = float("inf")
+    validation_checks_without_improvement = 0
     if args.resume:
         print(f"Resuming from: {args.resume}")
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
@@ -300,11 +329,36 @@ def main():
             print(f"validation step={step} | val_loss={validation_loss:.4f} | {group_text}")
             if validation_loss < best_validation_loss:
                 best_validation_loss = validation_loss
+                validation_checks_without_improvement = 0
                 best_path = Path(args.output_dir) / "best_validation.pt"
                 save_checkpoint(
                     best_path, step, model, optimizer, scaler, config, best_validation_loss
                 )
                 print(f"  -> new best validation checkpoint: {best_path}")
+            else:
+                validation_checks_without_improvement += 1
+            if args.text_diagnostics:
+                shuffled_loss, _ = validate(
+                    model,
+                    validation_loader,
+                    args.device,
+                    weights,
+                    args.validation_batches,
+                    shuffle_text=True,
+                )
+                print(
+                    f"text diagnostic step={step} | normal={validation_loss:.4f} | "
+                    f"shuffled={shuffled_loss:.4f} | delta={shuffled_loss - validation_loss:.4f}"
+                )
+            if (
+                args.early_stopping_patience is not None
+                and validation_checks_without_improvement >= args.early_stopping_patience
+            ):
+                print(
+                    f"Early stopping after {validation_checks_without_improvement} "
+                    "validation checks without improvement."
+                )
+                break
 
         # Checkpoint
         if step % config.checkpoint_every == 0:
