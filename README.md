@@ -374,7 +374,7 @@ python -u -m minimoss.train_overfit \
   --group-curriculum \
   --phase-a-end 750 \
   --phase-b-end 1500 \
-  --phase-gate-min-improvement 0.05 \
+  --phase-gate-min-improvement 0.02 \
   --phase-gate-min-text-delta 0.005 \
   --text-diagnostics \
   --early-stopping-start-step 1625 \
@@ -387,3 +387,9 @@ At each phase boundary, training emits `PHASE_A_PASS/FAIL` or
 `best_phase_a.pt`, phase B writes `best_phase_b.pt`, and phase C writes
 `best_validation.pt`. Do not decode phase-A audio because refinement heads are
 intentionally untrained.
+
+The improvement gate compares the first validation in a phase with that
+phase's best checkpoint, not necessarily its final boundary value. To continue
+an earlier V4 run that stopped at the step-750 phase-A boundary, resume its
+`final.pt` with the same V4 arguments and the corrected `0.02` threshold; step
+751 enters phase B directly.

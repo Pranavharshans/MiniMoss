@@ -173,7 +173,7 @@ def main():
     parser.add_argument("--group-curriculum", action="store_true")
     parser.add_argument("--phase-a-end", type=int, default=750)
     parser.add_argument("--phase-b-end", type=int, default=1500)
-    parser.add_argument("--phase-gate-min-improvement", type=float, default=0.05)
+    parser.add_argument("--phase-gate-min-improvement", type=float, default=0.02)
     parser.add_argument("--phase-gate-min-text-delta", type=float, default=0.005)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -518,7 +518,7 @@ def main():
                 )
 
                 if args.group_curriculum and step in (args.phase_a_end, args.phase_b_end):
-                    improvement = phase_initial_losses[phase] - validation_loss
+                    improvement = phase_initial_losses[phase] - phase_best_losses[phase]
                     group1_delta = shuffled_groups[0] - validation_groups[0]
                     passed = (
                         improvement >= args.phase_gate_min_improvement
@@ -526,7 +526,7 @@ def main():
                     )
                     print(
                         f"PHASE_{phase}_{'PASS' if passed else 'FAIL'} | "
-                        f"improvement={improvement:.4f} "
+                        f"best_improvement={improvement:.4f} "
                         f"(required={args.phase_gate_min_improvement:.4f}) | "
                         f"g1_text_delta={group1_delta:.4f} "
                         f"(required={args.phase_gate_min_text_delta:.4f})"

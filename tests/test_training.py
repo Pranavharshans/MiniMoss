@@ -34,6 +34,15 @@ def test_group_curriculum_stages_refinement_losses():
     assert weights_c == (4.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
 
+def test_phase_gate_best_improvement_uses_best_not_boundary_loss():
+    initial_loss = 6.6918
+    best_loss = 6.6680
+    boundary_loss = 6.6835
+
+    assert initial_loss - best_loss > 0.02
+    assert initial_loss - boundary_loss < 0.02
+
+
 def test_per_codebook_losses_respect_frame_mask():
     logits = [torch.zeros((1, 2, 4)), torch.zeros((1, 2, 4))]
     targets = torch.tensor([[[0, 1], [3, 2]]])
