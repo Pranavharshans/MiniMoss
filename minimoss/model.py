@@ -207,6 +207,15 @@ class MiniMossModel(nn.Module):
                 nn.GELU(),
                 nn.Linear(config.local_hidden_size, config.backbone_hidden_size),
             )
+        self.frame_position_embeddings = None
+        self.frame_context_null = None
+        if getattr(config, "use_frame_position_embedding", False):
+            self.frame_position_embeddings = nn.Embedding(
+                config.max_frames, config.backbone_hidden_size
+            )
+            self.frame_context_null = nn.Parameter(
+                torch.empty(config.backbone_hidden_size)
+            )
 
         # Local decoder
         self.local_decoder = LocalTransformer(config)
@@ -231,6 +240,8 @@ class MiniMossModel(nn.Module):
             elif isinstance(module, LocalRMSNorm):
                 nn.init.ones_(module.weight)
         nn.init.normal_(self.frame_start, mean=0.0, std=std)
+        if self.frame_context_null is not None:
+            nn.init.normal_(self.frame_context_null, mean=0.0, std=std)
 
     @property
     def backbone(self):
@@ -284,6 +295,7 @@ class MiniMossModel(nn.Module):
         audio_codes: torch.LongTensor,
         text_attention_mask: Optional[torch.LongTensor] = None,
         audio_frame_mask: Optional[torch.Tensor] = None,
+        audio_context_dropout_prob: float = 0.0,
     ) -> torch.Tensor:
         """Produce causal frame hidden states with a frozen Qwen backbone.
 
@@ -296,6 +308,12 @@ class MiniMossModel(nn.Module):
             raise ValueError(f"Expected {self.config.n_codebooks} codebooks, got {n_cb}")
         if T_audio > self.config.max_frames:
             raise ValueError(f"Audio has {T_audio} frames, max_frames is {self.config.max_frames}")
+        if not 0.0 <= audio_context_dropout_prob <= 1.0:
+            raise ValueError("audio_context_dropout_prob must be in [0, 1]")
+        if audio_context_dropout_prob > 0.0 and self.frame_conditioner is None:
+            raise ValueError(
+                "Audio context dropout requires the nonlinear frame conditioner"
+            )
 
         backbone = self.backbone.to(text_tokens.device)
         backbone.eval()
@@ -311,14 +329,27 @@ class MiniMossModel(nn.Module):
                 shifted_frames[:, 1:] = frame_summaries[:, :-1]
             frame_inputs = self.frame_to_backbone(shifted_frames)
         else:
-            frame_inputs = torch.empty(
-                (B, T_audio, self.config.backbone_hidden_size),
-                device=frame_summaries.device,
-                dtype=frame_summaries.dtype,
+            start_context = self.frame_to_backbone(self.frame_start).view(1, 1, -1)
+            start_context = start_context.expand(B, 1, -1)
+            frame_inputs = torch.cat(
+                [start_context, frame_summaries[:, :-1]], dim=1
             )
-            frame_inputs[:, 0] = self.frame_to_backbone(self.frame_start)
-            if T_audio > 1:
-                frame_inputs[:, 1:] = frame_summaries[:, :-1]
+            if audio_context_dropout_prob > 0.0 and T_audio > 1:
+                if self.frame_context_null is None:
+                    raise ValueError(
+                        "Audio context dropout requires frame-position conditioning"
+                    )
+                drop_mask = torch.rand(
+                    (B, T_audio - 1, 1), device=frame_inputs.device
+                ) < audio_context_dropout_prob
+                null_context = self.frame_context_null.view(1, 1, -1)
+                history_inputs = torch.where(
+                    drop_mask, null_context, frame_inputs[:, 1:]
+                )
+                frame_inputs = torch.cat([frame_inputs[:, :1], history_inputs], dim=1)
+            if self.frame_position_embeddings is not None:
+                positions = torch.arange(T_audio, device=frame_inputs.device)
+                frame_inputs = frame_inputs + self.frame_position_embeddings(positions)[None]
             frame_inputs = F.layer_norm(
                 frame_inputs, (self.config.backbone_hidden_size,)
             )
@@ -373,6 +404,7 @@ class MiniMossModel(nn.Module):
         audio_codes: torch.LongTensor,
         text_attention_mask: Optional[torch.LongTensor] = None,
         audio_frame_mask: Optional[torch.Tensor] = None,
+        audio_context_dropout_prob: float = 0.0,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """Forward pass with teacher forcing.
 
@@ -401,6 +433,7 @@ class MiniMossModel(nn.Module):
             audio_codes,
             text_attention_mask=text_attention_mask,
             audio_frame_mask=audio_frame_mask,
+            audio_context_dropout_prob=audio_context_dropout_prob,
         )
 
         # 2. Compute ground-truth group embeddings (for local teacher forcing)

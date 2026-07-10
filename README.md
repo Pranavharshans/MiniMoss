@@ -266,3 +266,74 @@ python -u -m minimoss.evaluate \
   --limit 20 \
   --device cuda 2>&1 | tee logs/evaluate_ljspeech_validation_v2.log
 ```
+
+## V3 Forced-Alignment Curriculum
+
+Use V3 when V2's shuffled-text loss is effectively identical to normal
+validation loss. V3 prevents the model from relying exclusively on the correct
+previous audio frame:
+
+- Every frame receives a learned absolute frame-position embedding.
+- Previous-audio context is replaced by a learned null vector for the first
+  curriculum phase, then gradually restored.
+- Validation reports normal, shuffled-text, and no-context losses.
+- Early stopping does not begin until the alignment curriculum is nearly done.
+
+On a 24 GB GPU where V2 batch 4 used about 10 GB, start with physical batch 8.
+This keeps approximately the same 20,000 total sample exposures in 2,500
+optimizer steps:
+
+```bash
+python -u -m minimoss.train_overfit \
+  --manifest data_ljspeech_1100/train_manifest.jsonl \
+  --validation-manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir checkpoints/ljspeech_1000_v3_b8 \
+  --batch-size 8 \
+  --max-steps 2500 \
+  --validate-every 125 \
+  --qwen-lora \
+  --qwen-lora-rank 8 \
+  --qwen-lora-alpha 16 \
+  --nonlinear-frame-conditioner \
+  --frame-position-embedding \
+  --context-dropout-warmup-steps 500 \
+  --context-dropout-decay-steps 1500 \
+  --context-dropout-start 1.0 \
+  --context-dropout-end 0.2 \
+  --text-diagnostics \
+  --early-stopping-start-step 2000 \
+  --early-stopping-patience 4 \
+  --device cuda 2>&1 | tee logs/train_ljspeech_1000_v3_b8.log
+```
+
+If batch 8 runs out of memory, use batch 6 with exposure-equivalent schedule:
+
+```bash
+python -u -m minimoss.train_overfit \
+  --manifest data_ljspeech_1100/train_manifest.jsonl \
+  --validation-manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir checkpoints/ljspeech_1000_v3_b6 \
+  --batch-size 6 \
+  --max-steps 3334 \
+  --validate-every 167 \
+  --qwen-lora \
+  --qwen-lora-rank 8 \
+  --qwen-lora-alpha 16 \
+  --nonlinear-frame-conditioner \
+  --frame-position-embedding \
+  --context-dropout-warmup-steps 667 \
+  --context-dropout-decay-steps 2000 \
+  --context-dropout-start 1.0 \
+  --context-dropout-end 0.2 \
+  --text-diagnostics \
+  --early-stopping-start-step 2667 \
+  --early-stopping-patience 4 \
+  --device cuda 2>&1 | tee logs/train_ljspeech_1000_v3_b6.log
+```
+
+For V3, a useful result requires the shuffled-text delta to become clearly
+positive while no-context validation improves. A near-zero shuffled-text delta
+after the full-context-drop phase means the architecture still has no usable
+text-to-frame alignment signal.

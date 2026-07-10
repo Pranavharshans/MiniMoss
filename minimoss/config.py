@@ -20,6 +20,7 @@ class MiniMossConfig:
     n_codebooks: int = 32
     codebook_size: int = 1024
     use_nonlinear_frame_conditioner: bool = False
+    use_frame_position_embedding: bool = False
 
     # Grouped local decoder
     n_groups: int = 8

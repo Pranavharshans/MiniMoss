@@ -27,6 +27,22 @@ def weighted_loss(group_losses, weights):
     return sum(weight * loss for weight, loss in zip(weights, group_losses)) / sum(weights)
 
 
+def context_dropout_for_step(
+    step: int,
+    warmup_steps: int,
+    decay_steps: int,
+    start_probability: float,
+    end_probability: float,
+) -> float:
+    """Hold dropout high, then linearly decay it to the inference-adjacent floor."""
+    if step <= warmup_steps:
+        return start_probability
+    if decay_steps == 0 or step >= warmup_steps + decay_steps:
+        return end_probability
+    progress = (step - warmup_steps) / decay_steps
+    return start_probability + progress * (end_probability - start_probability)
+
+
 def trainable_state_dict(model):
     """Return a checkpoint without duplicating the frozen Hugging Face backbone."""
     trainable_names = {
@@ -51,7 +67,15 @@ def save_checkpoint(path, step, model, optimizer, scaler, config, best_validatio
 
 
 @torch.inference_mode()
-def validate(model, loader, device, weights, max_batches=None, shuffle_text=False):
+def validate(
+    model,
+    loader,
+    device,
+    weights,
+    max_batches=None,
+    shuffle_text=False,
+    audio_context_dropout_prob=0.0,
+):
     model.eval()
     total_loss = 0.0
     total_groups = [0.0] * len(weights)
@@ -70,6 +94,7 @@ def validate(model, loader, device, weights, max_batches=None, shuffle_text=Fals
             rvq,
             text_attention_mask=text_mask,
             audio_frame_mask=audio_mask,
+            audio_context_dropout_prob=audio_context_dropout_prob,
         )
         total_loss += weighted_loss(group_losses, weights).item()
         for index, loss in enumerate(group_losses):
@@ -100,10 +125,16 @@ def main():
     parser.add_argument("--qwen-lora-rank", type=int, default=8)
     parser.add_argument("--qwen-lora-alpha", type=float, default=16.0)
     parser.add_argument("--nonlinear-frame-conditioner", action="store_true")
+    parser.add_argument("--frame-position-embedding", action="store_true")
+    parser.add_argument("--context-dropout-warmup-steps", type=int, default=1000)
+    parser.add_argument("--context-dropout-decay-steps", type=int, default=3000)
+    parser.add_argument("--context-dropout-start", type=float, default=0.0)
+    parser.add_argument("--context-dropout-end", type=float, default=0.0)
     parser.add_argument("--text-diagnostics", action="store_true",
                         help="Also validate with text reversed across each batch")
     parser.add_argument("--early-stopping-patience", type=int, default=None,
                         help="Stop after this many validation checks without improvement")
+    parser.add_argument("--early-stopping-start-step", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--codec", default="OpenMOSS-Team/MOSS-Audio-Tokenizer",
@@ -134,6 +165,7 @@ def main():
         qwen_lora_rank=args.qwen_lora_rank,
         qwen_lora_alpha=args.qwen_lora_alpha,
         use_nonlinear_frame_conditioner=args.nonlinear_frame_conditioner,
+        use_frame_position_embedding=args.frame_position_embedding,
     )
     if args.max_steps is not None:
         config.max_steps = args.max_steps
@@ -143,6 +175,14 @@ def main():
         raise ValueError("--validation-batches must be positive")
     if args.early_stopping_patience is not None and args.early_stopping_patience <= 0:
         raise ValueError("--early-stopping-patience must be positive")
+    if args.context_dropout_warmup_steps < 0 or args.context_dropout_decay_steps < 0:
+        raise ValueError("Context-dropout schedule steps cannot be negative")
+    if not 0.0 <= args.context_dropout_end <= args.context_dropout_start <= 1.0:
+        raise ValueError("Context dropout must satisfy 0 <= end <= start <= 1")
+    if args.context_dropout_start > 0 and not args.frame_position_embedding:
+        raise ValueError("Context dropout requires --frame-position-embedding")
+    if args.context_dropout_start > 0 and not args.nonlinear_frame_conditioner:
+        raise ValueError("Context dropout requires --nonlinear-frame-conditioner")
 
     print("=" * 60)
     print("MiniMoss Overfit Training")
@@ -162,6 +202,12 @@ def main():
     print(f"  resume: {args.resume}")
     print(f"  qwen_lora: {config.use_qwen_lora} (rank={config.qwen_lora_rank})")
     print(f"  nonlinear_frame_conditioner: {config.use_nonlinear_frame_conditioner}")
+    print(f"  frame_position_embedding: {config.use_frame_position_embedding}")
+    print(
+        f"  context_dropout: {args.context_dropout_start:.2f} -> "
+        f"{args.context_dropout_end:.2f} after warmup={args.context_dropout_warmup_steps}, "
+        f"decay={args.context_dropout_decay_steps}"
+    )
 
     # Dataset
     dataset = MiniMossDataset(
@@ -255,6 +301,13 @@ def main():
 
     for step in range(start_step + 1, total_steps + 1):
         t_start = time.time()
+        context_dropout = context_dropout_for_step(
+            step,
+            args.context_dropout_warmup_steps,
+            args.context_dropout_decay_steps,
+            args.context_dropout_start,
+            args.context_dropout_end,
+        )
 
         if args.overfit_one_batch:
             text_input, mask_input = text_batch, mask_batch
@@ -281,6 +334,7 @@ def main():
                     rvq_input,
                     text_attention_mask=mask_input,
                     audio_frame_mask=audio_mask_input,
+                    audio_context_dropout_prob=context_dropout,
                 )
         else:
             logits, group_losses = model(
@@ -288,6 +342,7 @@ def main():
                 rvq_input,
                 text_attention_mask=mask_input,
                 audio_frame_mask=audio_mask_input,
+                audio_context_dropout_prob=context_dropout,
             )
 
         # Weighted total loss
@@ -312,7 +367,10 @@ def main():
         # Log
         if step % config.log_every == 0 or step == 1:
             g_losses = [gl.item() for gl in group_losses]
-            print(format_metrics(step, total_loss.item(), g_losses, config.learning_rate, step_time))
+            metrics = format_metrics(
+                step, total_loss.item(), g_losses, config.learning_rate, step_time
+            )
+            print(f"{metrics} | context_drop={context_dropout:.3f}")
 
         if validation_loader is not None and step % args.validate_every == 0:
             validation_loss, validation_groups = validate(
@@ -335,7 +393,7 @@ def main():
                     best_path, step, model, optimizer, scaler, config, best_validation_loss
                 )
                 print(f"  -> new best validation checkpoint: {best_path}")
-            else:
+            elif step >= args.early_stopping_start_step:
                 validation_checks_without_improvement += 1
             if args.text_diagnostics:
                 shuffled_loss, _ = validate(
@@ -350,8 +408,22 @@ def main():
                     f"text diagnostic step={step} | normal={validation_loss:.4f} | "
                     f"shuffled={shuffled_loss:.4f} | delta={shuffled_loss - validation_loss:.4f}"
                 )
+                no_context_loss, _ = validate(
+                    model,
+                    validation_loader,
+                    args.device,
+                    weights,
+                    args.validation_batches,
+                    audio_context_dropout_prob=1.0,
+                )
+                print(
+                    f"context diagnostic step={step} | normal={validation_loss:.4f} | "
+                    f"no_context={no_context_loss:.4f} | "
+                    f"delta={no_context_loss - validation_loss:.4f}"
+                )
             if (
                 args.early_stopping_patience is not None
+                and step >= args.early_stopping_start_step
                 and validation_checks_without_improvement >= args.early_stopping_patience
             ):
                 print(

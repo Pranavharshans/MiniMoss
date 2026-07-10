@@ -102,6 +102,30 @@ def test_nonlinear_frame_conditioner_preserves_causal_shift():
     assert not torch.allclose(hidden_a[:, 3], hidden_b[:, 3])
 
 
+def test_full_context_dropout_removes_previous_audio_shortcut():
+    torch.manual_seed(5)
+    config = tiny_config()
+    config.use_nonlinear_frame_conditioner = True
+    config.use_frame_position_embedding = True
+    model = MiniMossModel(config)
+    model._backbone = FakeBackbone(vocab_size=32, hidden_size=12)
+    model._backbone.requires_grad_(False)
+    audio_a = torch.randint(0, 16, (1, 4, 8))
+    audio_b = torch.randint(0, 16, (1, 4, 8))
+
+    hidden_a = model.encode_frames(
+        torch.tensor([[1, 2]]), audio_a, audio_context_dropout_prob=1.0
+    )
+    hidden_b = model.encode_frames(
+        torch.tensor([[1, 2]]), audio_b, audio_context_dropout_prob=1.0
+    )
+
+    assert torch.allclose(hidden_a, hidden_b)
+    hidden_a.sum().backward()
+    assert model.frame_context_null.grad is not None
+    assert model.frame_position_embeddings.weight.grad is not None
+
+
 def test_lora_adapter_trains_only_low_rank_update():
     module = nn.Module()
     module.q_proj = nn.Linear(12, 12, bias=False)
