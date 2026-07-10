@@ -337,3 +337,53 @@ For V3, a useful result requires the shuffled-text delta to become clearly
 positive while no-context validation improves. A near-zero shuffled-text delta
 after the full-context-drop phase means the architecture still has no usable
 text-to-frame alignment signal.
+
+## V4 Gated Group Curriculum
+
+V4 isolates the text-dependent coarse RVQ prediction before allowing
+teacher-forced refinement groups to influence optimization:
+
+- Phase A, steps 1-750: group 1 only, weights `1,0,0,0,0,0,0,0`.
+- Phase B, steps 751-1500: groups 1-4, weights `4,1,1,1,0,0,0,0`.
+- Phase C, steps 1501-3000: all groups, weights `4,1,1,1,1,1,1,1`.
+- Previous-frame context stays fully hidden through phases A and B.
+- Phase checkpoints use no-context validation in A/B and normal inference
+  context in C.
+- Per-codebook validation exposes whether codebooks 1-4 can be grouped safely.
+
+Run from scratch with batch 8:
+
+```bash
+python -u -m minimoss.train_overfit \
+  --manifest data_ljspeech_1100/train_manifest.jsonl \
+  --validation-manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir checkpoints/ljspeech_1000_v4_b8 \
+  --batch-size 8 \
+  --max-steps 3000 \
+  --validate-every 125 \
+  --qwen-lora \
+  --qwen-lora-rank 8 \
+  --qwen-lora-alpha 16 \
+  --nonlinear-frame-conditioner \
+  --frame-position-embedding \
+  --context-dropout-warmup-steps 1500 \
+  --context-dropout-decay-steps 1000 \
+  --context-dropout-start 1.0 \
+  --context-dropout-end 0.2 \
+  --group-curriculum \
+  --phase-a-end 750 \
+  --phase-b-end 1500 \
+  --phase-gate-min-improvement 0.05 \
+  --phase-gate-min-text-delta 0.005 \
+  --text-diagnostics \
+  --early-stopping-start-step 1625 \
+  --early-stopping-patience 4 \
+  --device cuda 2>&1 | tee logs/train_ljspeech_1000_v4_b8.log
+```
+
+At each phase boundary, training emits `PHASE_A_PASS/FAIL` or
+`PHASE_B_PASS/FAIL`. A failed phase stops immediately. Phase A writes
+`best_phase_a.pt`, phase B writes `best_phase_b.pt`, and phase C writes
+`best_validation.pt`. Do not decode phase-A audio because refinement heads are
+intentionally untrained.

@@ -1,6 +1,11 @@
 import pytest
+import torch
 
-from minimoss.train_overfit import context_dropout_for_step
+from minimoss.train_overfit import (
+    context_dropout_for_step,
+    curriculum_phase_and_weights,
+    per_codebook_losses,
+)
 
 
 def test_context_dropout_schedule_holds_then_decays():
@@ -14,3 +19,28 @@ def test_context_dropout_schedule_holds_then_decays():
 
 def test_context_dropout_schedule_supports_no_decay():
     assert context_dropout_for_step(101, 100, 0, 1.0, 0.2) == 0.2
+
+
+def test_group_curriculum_stages_refinement_losses():
+    phase_a, weights_a = curriculum_phase_and_weights(750, 750, 1500)
+    phase_b, weights_b = curriculum_phase_and_weights(751, 750, 1500)
+    phase_c, weights_c = curriculum_phase_and_weights(1501, 750, 1500)
+
+    assert phase_a == "A"
+    assert weights_a == (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    assert phase_b == "B"
+    assert weights_b == (4.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+    assert phase_c == "C"
+    assert weights_c == (4.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+
+
+def test_per_codebook_losses_respect_frame_mask():
+    logits = [torch.zeros((1, 2, 4)), torch.zeros((1, 2, 4))]
+    targets = torch.tensor([[[0, 1], [3, 2]]])
+    mask = torch.tensor([[True, False]])
+
+    losses = per_codebook_losses(logits, targets, mask, codebook_size=4)
+
+    assert len(losses) == 2
+    assert losses[0].item() == pytest.approx(torch.log(torch.tensor(4.0)).item())
+    assert losses[1].item() == pytest.approx(torch.log(torch.tensor(4.0)).item())

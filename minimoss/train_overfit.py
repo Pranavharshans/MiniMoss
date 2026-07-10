@@ -43,6 +43,29 @@ def context_dropout_for_step(
     return start_probability + progress * (end_probability - start_probability)
 
 
+def curriculum_phase_and_weights(step: int, phase_a_end: int, phase_b_end: int):
+    """Return the V4 phase and loss weights for eight grouped RVQ steps."""
+    if step <= phase_a_end:
+        return "A", (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    if step <= phase_b_end:
+        return "B", (4.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+    return "C", (4.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+
+
+def per_codebook_losses(logits, audio_codes, audio_frame_mask, codebook_size):
+    losses = []
+    for codebook, codebook_logits in enumerate(logits):
+        targets = audio_codes[:, :, codebook].masked_fill(
+            ~audio_frame_mask.bool(), -100
+        )
+        losses.append(torch.nn.functional.cross_entropy(
+            codebook_logits.reshape(-1, codebook_size),
+            targets.reshape(-1),
+            ignore_index=-100,
+        ))
+    return losses
+
+
 def trainable_state_dict(model):
     """Return a checkpoint without duplicating the frozen Hugging Face backbone."""
     trainable_names = {
@@ -79,6 +102,7 @@ def validate(
     model.eval()
     total_loss = 0.0
     total_groups = [0.0] * len(weights)
+    total_codebooks = None
     batches = 0
     for text, text_mask, rvq, audio_mask in loader:
         if shuffle_text:
@@ -89,7 +113,7 @@ def validate(
         text_mask = text_mask.to(device)
         rvq = rvq.to(device)
         audio_mask = audio_mask.to(device)
-        _, group_losses = model(
+        logits, group_losses = model(
             text,
             rvq,
             text_attention_mask=text_mask,
@@ -99,13 +123,24 @@ def validate(
         total_loss += weighted_loss(group_losses, weights).item()
         for index, loss in enumerate(group_losses):
             total_groups[index] += loss.item()
+        codebook_losses = per_codebook_losses(
+            logits, rvq, audio_mask, model.config.codebook_size
+        )
+        if total_codebooks is None:
+            total_codebooks = [0.0] * len(codebook_losses)
+        for index, loss in enumerate(codebook_losses):
+            total_codebooks[index] += loss.item()
         batches += 1
         if max_batches is not None and batches >= max_batches:
             break
     model.train()
     if batches == 0:
         raise ValueError("Validation loader produced no batches")
-    return total_loss / batches, [loss / batches for loss in total_groups]
+    return (
+        total_loss / batches,
+        [loss / batches for loss in total_groups],
+        [loss / batches for loss in total_codebooks],
+    )
 
 
 def main():
@@ -135,6 +170,11 @@ def main():
     parser.add_argument("--early-stopping-patience", type=int, default=None,
                         help="Stop after this many validation checks without improvement")
     parser.add_argument("--early-stopping-start-step", type=int, default=0)
+    parser.add_argument("--group-curriculum", action="store_true")
+    parser.add_argument("--phase-a-end", type=int, default=750)
+    parser.add_argument("--phase-b-end", type=int, default=1500)
+    parser.add_argument("--phase-gate-min-improvement", type=float, default=0.05)
+    parser.add_argument("--phase-gate-min-text-delta", type=float, default=0.005)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--codec", default="OpenMOSS-Team/MOSS-Audio-Tokenizer",
@@ -183,6 +223,13 @@ def main():
         raise ValueError("Context dropout requires --frame-position-embedding")
     if args.context_dropout_start > 0 and not args.nonlinear_frame_conditioner:
         raise ValueError("Context dropout requires --nonlinear-frame-conditioner")
+    if args.group_curriculum:
+        if not 0 < args.phase_a_end < args.phase_b_end < config.max_steps:
+            raise ValueError("Group curriculum requires 0 < phase A < phase B < max steps")
+        if args.phase_a_end % args.validate_every or args.phase_b_end % args.validate_every:
+            raise ValueError("Phase boundaries must be divisible by --validate-every")
+        if not args.text_diagnostics:
+            raise ValueError("Group curriculum requires --text-diagnostics")
 
     print("=" * 60)
     print("MiniMoss Overfit Training")
@@ -207,6 +254,10 @@ def main():
         f"  context_dropout: {args.context_dropout_start:.2f} -> "
         f"{args.context_dropout_end:.2f} after warmup={args.context_dropout_warmup_steps}, "
         f"decay={args.context_dropout_decay_steps}"
+    )
+    print(
+        f"  group_curriculum: {args.group_curriculum} "
+        f"(A<= {args.phase_a_end}, B<= {args.phase_b_end})"
     )
 
     # Dataset
@@ -264,6 +315,8 @@ def main():
     start_step = 0
     best_validation_loss = float("inf")
     validation_checks_without_improvement = 0
+    phase_best_losses = {"A": float("inf"), "B": float("inf"), "C": float("inf")}
+    phase_initial_losses = {}
     if args.resume:
         print(f"Resuming from: {args.resume}")
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
@@ -308,6 +361,12 @@ def main():
             args.context_dropout_start,
             args.context_dropout_end,
         )
+        if args.group_curriculum:
+            phase, weights = curriculum_phase_and_weights(
+                step, args.phase_a_end, args.phase_b_end
+            )
+        else:
+            phase, weights = "standard", config.group_loss_weights
 
         if args.overfit_one_batch:
             text_input, mask_input = text_batch, mask_batch
@@ -346,7 +405,6 @@ def main():
             )
 
         # Weighted total loss
-        weights = config.group_loss_weights
         total_loss = weighted_loss(group_losses, weights)
 
         # Backward
@@ -370,22 +428,48 @@ def main():
             metrics = format_metrics(
                 step, total_loss.item(), g_losses, config.learning_rate, step_time
             )
-            print(f"{metrics} | context_drop={context_dropout:.3f}")
+            print(
+                f"{metrics} | phase={phase} | context_drop={context_dropout:.3f} | "
+                f"weights={','.join(f'{weight:g}' for weight in weights)}"
+            )
 
         if validation_loader is not None and step % args.validate_every == 0:
-            validation_loss, validation_groups = validate(
+            validation_context_dropout = (
+                1.0 if args.group_curriculum and phase in ("A", "B") else 0.0
+            )
+            validation_loss, validation_groups, validation_codebooks = validate(
                 model,
                 validation_loader,
                 args.device,
                 weights,
                 args.validation_batches,
+                audio_context_dropout_prob=validation_context_dropout,
             )
+            phase_initial_losses.setdefault(phase, validation_loss)
             group_text = " | ".join(
                 f"val_g{index + 1}={loss:.4f}"
                 for index, loss in enumerate(validation_groups)
             )
-            print(f"validation step={step} | val_loss={validation_loss:.4f} | {group_text}")
-            if validation_loss < best_validation_loss:
+            print(
+                f"validation step={step} | phase={phase} | "
+                f"val_loss={validation_loss:.4f} | {group_text}"
+            )
+            codebook_text = " | ".join(
+                f"cb{index + 1}={loss:.4f}"
+                for index, loss in enumerate(validation_codebooks)
+            )
+            print(f"codebook validation step={step} | {codebook_text}")
+
+            if args.group_curriculum and validation_loss < phase_best_losses[phase]:
+                phase_best_losses[phase] = validation_loss
+                phase_path = Path(args.output_dir) / f"best_phase_{phase.lower()}.pt"
+                save_checkpoint(
+                    phase_path, step, model, optimizer, scaler, config, validation_loss
+                )
+                print(f"  -> new best phase {phase} checkpoint: {phase_path}")
+
+            tracks_final_metric = not args.group_curriculum or phase == "C"
+            if tracks_final_metric and validation_loss < best_validation_loss:
                 best_validation_loss = validation_loss
                 validation_checks_without_improvement = 0
                 best_path = Path(args.output_dir) / "best_validation.pt"
@@ -396,31 +480,60 @@ def main():
             elif step >= args.early_stopping_start_step:
                 validation_checks_without_improvement += 1
             if args.text_diagnostics:
-                shuffled_loss, _ = validate(
+                shuffled_loss, shuffled_groups, shuffled_codebooks = validate(
                     model,
                     validation_loader,
                     args.device,
                     weights,
                     args.validation_batches,
                     shuffle_text=True,
+                    audio_context_dropout_prob=validation_context_dropout,
                 )
                 print(
                     f"text diagnostic step={step} | normal={validation_loss:.4f} | "
-                    f"shuffled={shuffled_loss:.4f} | delta={shuffled_loss - validation_loss:.4f}"
+                    f"shuffled={shuffled_loss:.4f} | delta={shuffled_loss - validation_loss:.4f} | "
+                    f"g1_delta={shuffled_groups[0] - validation_groups[0]:.4f}"
                 )
-                no_context_loss, _ = validate(
+                coarse_deltas = " | ".join(
+                    f"cb{index + 1}_delta={shuffled_codebooks[index] - validation_codebooks[index]:.4f}"
+                    for index in range(min(4, len(validation_codebooks)))
+                )
+                print(f"coarse text diagnostic step={step} | {coarse_deltas}")
+                alternate_context_dropout = 1.0 - validation_context_dropout
+                alternate_context_loss, _, _ = validate(
                     model,
                     validation_loader,
                     args.device,
                     weights,
                     args.validation_batches,
-                    audio_context_dropout_prob=1.0,
+                    audio_context_dropout_prob=alternate_context_dropout,
                 )
                 print(
-                    f"context diagnostic step={step} | normal={validation_loss:.4f} | "
-                    f"no_context={no_context_loss:.4f} | "
-                    f"delta={no_context_loss - validation_loss:.4f}"
+                    f"context diagnostic step={step} | "
+                    f"primary_drop={validation_context_dropout:.1f} "
+                    f"primary={validation_loss:.4f} | "
+                    f"alternate_drop={alternate_context_dropout:.1f} "
+                    f"alternate={alternate_context_loss:.4f} | "
+                    f"delta={alternate_context_loss - validation_loss:.4f}"
                 )
+
+                if args.group_curriculum and step in (args.phase_a_end, args.phase_b_end):
+                    improvement = phase_initial_losses[phase] - validation_loss
+                    group1_delta = shuffled_groups[0] - validation_groups[0]
+                    passed = (
+                        improvement >= args.phase_gate_min_improvement
+                        and group1_delta >= args.phase_gate_min_text_delta
+                    )
+                    print(
+                        f"PHASE_{phase}_{'PASS' if passed else 'FAIL'} | "
+                        f"improvement={improvement:.4f} "
+                        f"(required={args.phase_gate_min_improvement:.4f}) | "
+                        f"g1_text_delta={group1_delta:.4f} "
+                        f"(required={args.phase_gate_min_text_delta:.4f})"
+                    )
+                    if not passed:
+                        print(f"Stopping because phase {phase} alignment gate failed.")
+                        break
             if (
                 args.early_stopping_patience is not None
                 and step >= args.early_stopping_start_step
