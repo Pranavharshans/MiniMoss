@@ -21,7 +21,6 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 
-from .config import MiniMossConfig
 from .model import MiniMossModel
 from .codec import AudioCodec
 from .utils import set_seed
@@ -49,19 +48,27 @@ def generate(
     cbg = config.codebooks_per_group
     n_cb = config.n_codebooks
 
-    # Encode text
+    # Encode text. Frame states are produced causally inside the frame loop.
     text_tokens = tokenizer.encode(text, add_special_tokens=False)
     text_tokens = torch.tensor([text_tokens], dtype=torch.long, device=device)
-    text_hidden = model.encode_text(text_tokens)  # [1, D_backbone]
-    h = model.projection(text_hidden)  # [1, D_local]
+    text_mask = torch.ones_like(text_tokens)
 
     all_codes = []
-    local_past = None  # could cache local decoder KV for efficiency
 
     for frame_idx in range(max_frames):
-        # Frame hidden = projected text + frame position
-        pos = torch.tensor([[frame_idx]], dtype=torch.long, device=device)
-        frame_h = (h + model.frame_pos_embed(pos)).squeeze(1)  # [1, D_local]
+        # Append a placeholder current frame. encode_frames shifts history so
+        # this position can see only previously generated RVQ frames.
+        if all_codes:
+            history = torch.stack(all_codes, dim=0).unsqueeze(0)
+            placeholder = torch.zeros((1, 1, n_cb), dtype=torch.long, device=device)
+            frame_context = torch.cat([history, placeholder], dim=1)
+        else:
+            frame_context = torch.zeros((1, 1, n_cb), dtype=torch.long, device=device)
+        frame_h = model.encode_frames(
+            text_tokens,
+            frame_context,
+            text_attention_mask=text_mask,
+        )[:, -1, :]
 
         # Decoder input starts with frame hidden
         decoder_states = [frame_h]  # list of [1, D_local]
@@ -123,11 +130,12 @@ def teacher_forced_generate(
 
     B, T_audio, _ = rvq_gt.shape
 
-    text_hidden = model.encode_text(text_tokens)
-    h = model.projection(text_hidden)  # [1, D_local]
-
-    positions = torch.arange(T_audio, device=device).unsqueeze(0)
-    frame_h = h.unsqueeze(1) + model.frame_pos_embed(positions)  # [1, T_audio, D_local]
+    text_mask = torch.ones_like(text_tokens)
+    frame_h = model.encode_frames(
+        text_tokens,
+        rvq_gt,
+        text_attention_mask=text_mask,
+    )
 
     all_codes = []
     for t in range(T_audio):
@@ -171,7 +179,8 @@ def main():
     parser.add_argument("--teacher-forced", default=None,
                         help="Path to pre-tokenized .pt file for teacher-forced generation")
     parser.add_argument("--output", default="generated.wav")
-    parser.add_argument("--codec-name", default="descript/dac_24khz")
+    parser.add_argument("--codec-name", default=None,
+                        help="Defaults to checkpoint config.codec_name")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -193,9 +202,14 @@ def main():
     model.eval()
 
     # Load codec
-    print(f"Loading codec: {args.codec_name}")
-    codec = AudioCodec(model_name=args.codec_name, n_quantizers=config.n_codebooks)
-    codec.model.to(args.device)
+    codec_name = args.codec_name or config.codec_name
+    print(f"Loading MOSS audio tokenizer: {codec_name}")
+    codec = AudioCodec(
+        model_name=codec_name,
+        n_quantizers=config.n_codebooks,
+    )
+    if hasattr(codec.model, "to"):
+        codec.model.to(args.device)
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.backbone_name)

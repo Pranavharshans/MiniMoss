@@ -10,13 +10,10 @@ Usage:
 """
 
 import argparse
-import json
 import os
 import time
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
-from pathlib import Path
 
 from .config import MiniMossConfig
 from .model import MiniMossModel
@@ -34,10 +31,13 @@ def main():
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--codec", default="OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                        help="Tokenizer name/checkpoint used to create the token files")
+    parser.add_argument("--n-codebooks", type=int, default=32,
+                        help="Number of RVQ codebooks in the token files")
+    parser.add_argument("--codebook-size", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--sample-text", default=None,
-                        help="Text to generate during training samples")
     parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
 
@@ -47,6 +47,10 @@ def main():
     config = MiniMossConfig(
         learning_rate=args.lr,
         batch_size=args.batch_size,
+        codec_name=args.codec,
+        n_codebooks=args.n_codebooks,
+        n_groups=args.n_codebooks // 4,
+        codebook_size=args.codebook_size,
         output_dir=args.output_dir,
         manifest_path=args.manifest,
         token_dir=args.token_dir,
@@ -59,10 +63,13 @@ def main():
     print("MiniMoss Overfit Training")
     print("=" * 60)
     print(f"  backbone: {config.backbone_name}")
+    print(f"  audio tokenizer name: {config.codec_name}")
     print(f"  local layers: {config.local_num_layers}")
     print(f"  local hidden: {config.local_hidden_size}")
     print(f"  n_codebooks: {config.n_codebooks}")
     print(f"  n_groups: {config.n_groups}")
+    print("  qwen: frozen")
+    print("  trainable: frame conditioner + projection + RVQ embeddings + local decoder + heads")
     print(f"  device: {args.device}")
     print(f"  overfit_one_batch: {args.overfit_one_batch}")
 
@@ -70,6 +77,9 @@ def main():
     dataset = MiniMossDataset(
         manifest_path=args.manifest,
         token_dir=args.token_dir,
+        max_frames=config.max_frames,
+        n_codebooks=config.n_codebooks,
+        codebook_size=config.codebook_size,
     )
     print(f"\nDataset: {len(dataset)} utterances")
 
@@ -85,6 +95,8 @@ def main():
     print("\nLoading model...")
     model = MiniMossModel(config)
     model.to(args.device)
+    _ = model.backbone
+    model.backbone.to(args.device)
 
     # Count parameters
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -94,14 +106,15 @@ def main():
     # Optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate, weight_decay=config.weight_decay)
-    scaler = torch.amp.GradScaler("cuda") if config.use_amp and args.device == "cuda" else None
+    scaler = torch.amp.GradScaler("cuda") if config.use_amp and args.device.startswith("cuda") else None
 
     # Get one batch for overfit mode
     if args.overfit_one_batch:
-        text_batch, mask_batch, rvq_batch = next(iter(loader))
+        text_batch, mask_batch, rvq_batch, audio_mask_batch = next(iter(loader))
         text_batch = text_batch.to(args.device)
         mask_batch = mask_batch.to(args.device)
         rvq_batch = rvq_batch.to(args.device)
+        audio_mask_batch = audio_mask_batch.to(args.device)
         print(f"  overfit batch: text={list(text_batch.shape)}, rvq={list(rvq_batch.shape)}")
 
     def _trainable_state_dict(model):
@@ -126,30 +139,41 @@ def main():
 
         if args.overfit_one_batch:
             text_input, mask_input = text_batch, mask_batch
-            rvq_input = rvq_batch
+            rvq_input, audio_mask_input = rvq_batch, audio_mask_batch
         else:
             try:
-                text_input, mask_input, rvq_input = next(data_iter)
+                text_input, mask_input, rvq_input, audio_mask_input = next(data_iter)
             except StopIteration:
                 data_iter = iter(DataLoader(
                     dataset, batch_size=config.batch_size, shuffle=True,
                     collate_fn=collate_fn, drop_last=False,
                 ))
-                text_input, mask_input, rvq_input = next(data_iter)
+                text_input, mask_input, rvq_input, audio_mask_input = next(data_iter)
             text_input = text_input.to(args.device)
             mask_input = mask_input.to(args.device)
             rvq_input = rvq_input.to(args.device)
+            audio_mask_input = audio_mask_input.to(args.device)
 
         # Forward
         if scaler is not None:
             with torch.amp.autocast("cuda"):
-                logits, group_losses = model(text_input, rvq_input, text_attention_mask=mask_input)
+                logits, group_losses = model(
+                    text_input,
+                    rvq_input,
+                    text_attention_mask=mask_input,
+                    audio_frame_mask=audio_mask_input,
+                )
         else:
-            logits, group_losses = model(text_input, rvq_input, text_attention_mask=mask_input)
+            logits, group_losses = model(
+                text_input,
+                rvq_input,
+                text_attention_mask=mask_input,
+                audio_frame_mask=audio_mask_input,
+            )
 
         # Weighted total loss
         weights = config.group_loss_weights
-        total_loss = sum(w * gl for w, gl in zip(weights, group_losses))
+        total_loss = sum(w * gl for w, gl in zip(weights, group_losses)) / sum(weights)
 
         # Backward
         optimizer.zero_grad()

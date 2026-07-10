@@ -5,8 +5,8 @@ Usage:
     python -m minimoss.prepare_tokens \\
         --manifest data/manifest.jsonl \\
         --token-dir data/tokens \\
-        --codec descript/dac_24khz \\
-        --n-codebooks 16
+        --codec OpenMOSS-Team/MOSS-Audio-Tokenizer \\
+        --n-codebooks 32
 """
 
 import argparse
@@ -25,8 +25,8 @@ def main():
     parser = argparse.ArgumentParser(description="Pre-tokenize audio for MiniMoss")
     parser.add_argument("--manifest", required=True, help="Input JSONL manifest")
     parser.add_argument("--token-dir", required=True, help="Output directory for token files")
-    parser.add_argument("--codec", default="descript/dac_24khz")
-    parser.add_argument("--n-codebooks", type=int, default=16)
+    parser.add_argument("--codec", default="OpenMOSS-Team/MOSS-Audio-Tokenizer")
+    parser.add_argument("--n-codebooks", type=int, default=32)
     parser.add_argument("--backbone", default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -34,9 +34,13 @@ def main():
     os.makedirs(args.token_dir, exist_ok=True)
 
     # Load codec
-    print(f"Loading codec: {args.codec}")
-    codec = AudioCodec(model_name=args.codec, n_quantizers=args.n_codebooks)
-    codec.model.to(args.device)
+    print(f"Loading MOSS audio tokenizer: {args.codec}")
+    codec = AudioCodec(
+        model_name=args.codec,
+        n_quantizers=args.n_codebooks,
+    )
+    if hasattr(codec.model, "to"):
+        codec.model.to(args.device)
     print(f"  sample_rate={codec.sample_rate}")
 
     # Load tokenizer
@@ -46,6 +50,8 @@ def main():
     # Load manifest
     with open(args.manifest) as f:
         items = [json.loads(line) for line in f if line.strip()]
+    if not items:
+        raise ValueError(f"Manifest is empty: {args.manifest}")
     print(f"Processing {len(items)} utterances")
 
     # Verify codec decode quality first
@@ -63,7 +69,7 @@ def main():
 
     decoded = codec.decode(codes)
     check_path = Path(args.token_dir) / "_codec_check.wav"
-    torchaudio.save(str(check_path), decoded.cpu(), codec.sample_rate)
+    torchaudio.save(str(check_path), decoded[0].cpu(), codec.sample_rate)
     print(f"  saved codec check: {check_path}")
     print("  Listen to this file. If it sounds bad, fix the codec setup before training.\n")
 
@@ -95,6 +101,9 @@ def main():
             "text": text,
             "text_tokens": text_tokens,
             "rvq": rvq,
+            "codec_name": args.codec,
+            "sample_rate": codec.sample_rate,
+            "n_codebooks": args.n_codebooks,
         }
         torch.save(out, os.path.join(args.token_dir, f"{utt_id}.pt"))
 

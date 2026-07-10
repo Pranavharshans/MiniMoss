@@ -31,13 +31,13 @@ text
   ↓
 Qwen2.5-0.5B frozen backbone
   ↓
-selected hidden states
+causal frame hidden states conditioned on text + previous RVQ frames
   ↓
 projection layer
   ↓
 grouped local decoder
   ↓
-16 RVQ tokens/frame
+32 RVQ tokens/frame
   ↓
 codec decoder
   ↓
@@ -56,32 +56,43 @@ Trainable:
 - grouped local decoder
 - output heads
 
-Codec:
-pretrained codec producing 16 RVQ codebooks/frame
+Audio tokenizer:
+`OpenMOSS-Team/MOSS-Audio-Tokenizer` producing 32 RVQ codebooks/frame,
+codebook size 1024.
+Do not substitute another codec: this experiment specifically evaluates the
+MOSS token hierarchy.
 ```
 
-If the chosen codec produces more than 16 codebooks, use the first 16 for the lean test.
+Load the official tokenizer with Hugging Face `AutoModel` and
+`trust_remote_code=True`. Its external code layout is `[Q, B, T]`; MiniMoss
+normalizes this to `[B, Q, T]` internally.
 
 ## 4. Grouped Local Decoder
 
-For each audio frame `t`, predict 16 RVQ tokens in 4 autoregressive group steps:
+For each audio frame `t`, predict 32 RVQ tokens in 8 autoregressive group steps:
 
 ```text
 step 1 -> codebooks 1-4
 step 2 -> codebooks 5-8, conditioned on group 1
 step 3 -> codebooks 9-12, conditioned on groups 1-2
 step 4 -> codebooks 13-16, conditioned on groups 1-3
+step 5 -> codebooks 17-20, conditioned on groups 1-4
+step 6 -> codebooks 21-24, conditioned on groups 1-5
+step 7 -> codebooks 25-28, conditioned on groups 1-6
+step 8 -> codebooks 29-32, conditioned on groups 1-7
 ```
 
 Factorization:
 
 ```text
-P(q1..q16 | h_t)
+P(q1..q32 | h_t)
 =
 P(q1..q4 | h_t)
 P(q5..q8 | h_t, q1..q4)
 P(q9..q12 | h_t, q1..q8)
 P(q13..q16 | h_t, q1..q12)
+...
+P(q29..q32 | h_t, q1..q28)
 ```
 
 Within each group, 4 codebooks are predicted in parallel.
@@ -143,7 +154,7 @@ Each token file should contain:
 {
     "id": str,
     "text": str,
-    "rvq": LongTensor[num_frames, 16],
+    "rvq": LongTensor[num_frames, 32],
 }
 ```
 
@@ -222,6 +233,10 @@ group_1_loss
 group_2_loss
 group_3_loss
 group_4_loss
+group_5_loss
+group_6_loss
+group_7_loss
+group_8_loss
 learning_rate
 step_time
 ```
@@ -408,6 +423,10 @@ No fancy sampling until greedy works.
 ```
 
 Use greedy generation first. Sampling can hide bugs.
+
+The frozen Qwen temporal path receives text embeddings followed by shifted
+audio-frame summaries. Frame `t` is conditioned on frame `t-1`, never on its
+own target. Free generation feeds predicted frames through the same path.
 
 The most important sanity check:
 

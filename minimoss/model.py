@@ -60,12 +60,14 @@ class LocalAttention(nn.Module):
     def __init__(self, config: MiniMossConfig):
         super().__init__()
         self.n_heads = config.local_num_heads
+        self.n_kv_heads = config.local_num_kv_heads
         self.head_dim = config.local_head_dim
         self.hidden_size = config.local_hidden_size
 
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        kv_size = self.n_kv_heads * self.head_dim
+        self.k_proj = nn.Linear(self.hidden_size, kv_size, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, kv_size, bias=False)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.dropout = nn.Dropout(config.local_dropout)
         self.rotary = RotaryEmbedding(self.head_dim)
@@ -74,13 +76,17 @@ class LocalAttention(nn.Module):
         B, T, D = x.shape
 
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         if position_ids is not None:
             cos, sin = self.rotary(position_ids, device=x.device, dtype=x.dtype)
             q = apply_rotary_pos_emb(q, cos, sin)
             k = apply_rotary_pos_emb(k, cos, sin)
+
+        repeats = self.n_heads // self.n_kv_heads
+        k = k.repeat_interleave(repeats, dim=1)
+        v = v.repeat_interleave(repeats, dim=1)
 
         y = F.scaled_dot_product_attention(
             q, k, v,
@@ -133,21 +139,6 @@ class LocalTransformer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# SwiGLU projection MLP (global -> local)
-# ---------------------------------------------------------------------------
-
-class ProjectionMLP(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, output_size: int):
-        super().__init__()
-        self.gate_proj = nn.Linear(input_size, hidden_size, bias=False)
-        self.up_proj = nn.Linear(input_size, hidden_size, bias=False)
-        self.down_proj = nn.Linear(hidden_size, output_size, bias=False)
-
-    def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-# ---------------------------------------------------------------------------
 # Full model
 # ---------------------------------------------------------------------------
 
@@ -159,21 +150,23 @@ class MiniMossModel(nn.Module):
         # Frozen backbone (lazy init)
         self._backbone = None
 
-        # Projection: backbone hidden -> local hidden
-        self.projection = ProjectionMLP(
-            input_size=config.backbone_hidden_size,
-            hidden_size=config.projection_ffn_hidden_size,
-            output_size=config.local_hidden_size,
+        # Single linear bridges preserve frame distinctions at initialization.
+        self.projection = nn.Linear(
+            config.backbone_hidden_size, config.local_hidden_size, bias=False
         )
-
-        # Frame position embeddings
-        self.frame_pos_embed = nn.Embedding(config.max_frames, config.local_hidden_size)
 
         # Codebook embeddings (one per codebook)
         self.codebook_embeddings = nn.ModuleList([
             nn.Embedding(config.codebook_size, config.local_hidden_size)
             for _ in range(config.n_codebooks)
         ])
+
+        # A shifted summary of frame t-1 is inserted into frozen Qwen to obtain
+        # the causal frame-level hidden state for frame t.
+        self.frame_start = nn.Parameter(torch.empty(config.local_hidden_size))
+        self.frame_to_backbone = nn.Linear(
+            config.local_hidden_size, config.backbone_hidden_size, bias=False
+        )
 
         # Local decoder
         self.local_decoder = LocalTransformer(config)
@@ -188,15 +181,16 @@ class MiniMossModel(nn.Module):
 
     def _init_weights(self):
         std = 0.02
-        for module in [self.projection, self.local_decoder, *self.output_heads]:
-            for p in module.parameters():
-                if p.dim() >= 2:
-                    nn.init.normal_(p, mean=0.0, std=std)
-                elif p.dim() == 1:
-                    nn.init.zeros_(p)
-        nn.init.normal_(self.frame_pos_embed.weight, mean=0.0, std=std)
-        for emb in self.codebook_embeddings:
-            nn.init.normal_(emb.weight, mean=0.0, std=std)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+            elif isinstance(module, LocalRMSNorm):
+                nn.init.ones_(module.weight)
+        nn.init.normal_(self.frame_start, mean=0.0, std=std)
 
     @property
     def backbone(self):
@@ -215,40 +209,64 @@ class MiniMossModel(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def encode_text(self, text_tokens: torch.LongTensor, attention_mask: Optional[torch.LongTensor] = None) -> torch.Tensor:
-        """Encode text tokens through frozen Qwen backbone, return pooled representation.
+    def _embed_audio_frames(self, audio_codes: torch.LongTensor) -> torch.Tensor:
+        """Summarize every RVQ frame into the local hidden space."""
+        frame_embedding = 0
+        for cb, embedding in enumerate(self.codebook_embeddings):
+            frame_embedding = frame_embedding + embedding(audio_codes[:, :, cb])
+        return frame_embedding / self.config.n_codebooks
 
-        NOTE: This mean-pools all text positions into a single vector, then repeats it
-        across audio frames with frame position embeddings. This is a simplification
-        vs. the PRD's "selected hidden states" per frame — it tests whether a
-        text-conditioned decoder can overfit, NOT whether Qwen produces per-frame
-        acoustic hidden states. A stronger version would interleave text and audio
-        tokens in the backbone sequence (as the official MOSS-TTS does).
+    def encode_frames(
+        self,
+        text_tokens: torch.LongTensor,
+        audio_codes: torch.LongTensor,
+        text_attention_mask: Optional[torch.LongTensor] = None,
+        audio_frame_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Produce causal frame hidden states with a frozen Qwen backbone.
+
+        Qwen receives text embeddings followed by shifted audio-frame summaries.
+        The input at frame t contains frame t-1, so current targets never leak.
+        Gradients flow through frozen Qwen into the trainable frame embeddings.
         """
+        B, T_audio, n_cb = audio_codes.shape
+        if n_cb != self.config.n_codebooks:
+            raise ValueError(f"Expected {self.config.n_codebooks} codebooks, got {n_cb}")
+        if T_audio > self.config.max_frames:
+            raise ValueError(f"Audio has {T_audio} frames, max_frames is {self.config.max_frames}")
+
         backbone = self.backbone.to(text_tokens.device)
+        backbone.eval()
+        text_embedding_layer = backbone.get_input_embeddings()
         with torch.no_grad():
-            out = backbone(text_tokens, attention_mask=attention_mask, output_hidden_states=False)
-        if attention_mask is not None:
-            mask = attention_mask.unsqueeze(-1).to(dtype=out.last_hidden_state.dtype)
-            pooled = (out.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+            text_embeds = text_embedding_layer(text_tokens)
+
+        frame_summaries = self._embed_audio_frames(audio_codes)
+        shifted_frames = torch.empty_like(frame_summaries)
+        shifted_frames[:, 0] = self.frame_start
+        if T_audio > 1:
+            shifted_frames[:, 1:] = frame_summaries[:, :-1]
+        frame_inputs = self.frame_to_backbone(shifted_frames)
+
+        if text_attention_mask is None:
+            text_attention_mask = torch.ones_like(text_tokens, dtype=torch.long)
+        if audio_frame_mask is None:
+            audio_frame_mask = torch.ones(
+                (B, T_audio), dtype=torch.long, device=audio_codes.device
+            )
         else:
-            pooled = out.last_hidden_state.mean(dim=1)
-        return pooled
+            audio_frame_mask = audio_frame_mask.to(device=audio_codes.device, dtype=torch.long)
 
-    def embed_group(self, group_codes: torch.LongTensor) -> torch.Tensor:
-        """Embed a group of codebook tokens.
-
-        Args:
-            group_codes: [..., codebooks_per_group] codebook indices
-
-        Returns:
-            [..., local_hidden_size] summed embedding
-        """
-        g = group_codes.shape[-1]  # codebooks_per_group
-        emb = 0
-        for i in range(g):
-            emb = emb + self.codebook_embeddings[i](group_codes[..., i])
-        return emb
+        inputs_embeds = torch.cat([text_embeds, frame_inputs], dim=1)
+        attention_mask = torch.cat([text_attention_mask.long(), audio_frame_mask], dim=1)
+        outputs = backbone(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            output_hidden_states=False,
+            use_cache=False,
+        )
+        frame_hidden = outputs.last_hidden_state[:, -T_audio:, :]
+        return self.projection(frame_hidden)
 
     def _get_group_embeddings(self, audio_codes: torch.LongTensor) -> list[torch.Tensor]:
         """Compute ground-truth group embeddings for all groups.
@@ -277,6 +295,7 @@ class MiniMossModel(nn.Module):
         text_tokens: torch.LongTensor,
         audio_codes: torch.LongTensor,
         text_attention_mask: Optional[torch.LongTensor] = None,
+        audio_frame_mask: Optional[torch.Tensor] = None,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """Forward pass with teacher forcing.
 
@@ -284,29 +303,33 @@ class MiniMossModel(nn.Module):
             text_tokens: [B, T_text] text token ids
             audio_codes: [B, T_audio, n_codebooks] ground-truth RVQ tokens
             text_attention_mask: [B, T_text] mask for valid (non-pad) text positions
+            audio_frame_mask: [B, T_audio] mask for valid audio frames
 
         Returns:
             logits: list of n_codebooks tensors, each [B, T_audio, codebook_size]
-            group_losses: list of 4 scalar tensors (one per group)
+            group_losses: list of scalar tensors, one per group
         """
         B, T_audio, n_cb = audio_codes.shape
         n_groups = self.config.n_groups
         cbg = self.config.codebooks_per_group
 
-        # 1. Encode text through frozen backbone
-        text_hidden = self.encode_text(text_tokens, attention_mask=text_attention_mask)  # [B, D_backbone]
+        if n_cb != self.config.n_codebooks:
+            raise ValueError(f"Expected {self.config.n_codebooks} codebooks, got {n_cb}")
+        if audio_frame_mask is None:
+            audio_frame_mask = torch.ones((B, T_audio), dtype=torch.bool, device=audio_codes.device)
 
-        # 2. Project to local hidden size
-        h = self.projection(text_hidden)  # [B, D_local]
+        # 1. Frozen Qwen emits one causal hidden state per audio frame.
+        frame_h = self.encode_frames(
+            text_tokens,
+            audio_codes,
+            text_attention_mask=text_attention_mask,
+            audio_frame_mask=audio_frame_mask,
+        )
 
-        # 3. Add frame position embeddings
-        positions = torch.arange(T_audio, device=h.device).unsqueeze(0)  # [1, T_audio]
-        frame_h = h.unsqueeze(1) + self.frame_pos_embed(positions)  # [B, T_audio, D_local]
-
-        # 4. Compute ground-truth group embeddings (for teacher forcing)
+        # 2. Compute ground-truth group embeddings (for local teacher forcing)
         group_embs = self._get_group_embeddings(audio_codes)  # list of [B, T_audio, D_local]
 
-        # 5. Build local decoder input sequence per frame:
+        # 3. Build local decoder input sequence per frame:
         #    [h_t] + group_embs[:-1] -> predict groups 0..n_groups-1
         #    Frame dimensions become batch: [B*T_audio, n_groups, D_local]
         input_parts = [frame_h.reshape(B * T_audio, 1, self.config.local_hidden_size)]
@@ -315,13 +338,13 @@ class MiniMossModel(nn.Module):
         decoder_input = torch.cat(input_parts, dim=1)
         # [B*T_audio, n_groups, D_local]
 
-        # 6. Run local decoder (causal)
+        # 4. Run local decoder (causal)
         group_position_ids = torch.arange(n_groups, device=decoder_input.device).unsqueeze(0)
         # [1, n_groups]
         decoder_output = self.local_decoder(decoder_input, position_ids=group_position_ids)
         # [B*T_audio, n_groups, D_local]
 
-        # 7. Compute logits per codebook from corresponding group output
+        # 5. Compute logits per codebook from corresponding group output
         logits = []
         for cb in range(n_cb):
             group_idx = cb // cbg
@@ -329,14 +352,16 @@ class MiniMossModel(nn.Module):
             cb_logits = cb_logits.reshape(B, T_audio, self.config.codebook_size)
             logits.append(cb_logits)
 
-        # 8. Compute per-group loss
+        # 6. Compute masked per-group loss
         per_group_losses = []
         for g in range(n_groups):
             loss_g = 0.0
             for cb in range(g * cbg, (g + 1) * cbg):
+                targets = audio_codes[:, :, cb].masked_fill(~audio_frame_mask.bool(), -100)
                 loss_g = loss_g + F.cross_entropy(
                     logits[cb].reshape(-1, self.config.codebook_size),
-                    audio_codes[:, :, cb].reshape(-1),
+                    targets.reshape(-1),
+                    ignore_index=-100,
                 )
             per_group_losses.append(loss_g / cbg)
 
