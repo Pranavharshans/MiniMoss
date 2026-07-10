@@ -23,7 +23,13 @@ run downloads both that checkpoint and `Qwen/Qwen2.5-0.5B`.
 
 ## Dataset
 
-Create `data/manifest.jsonl` with one object per line:
+Download ten clips from one LibriTTS-R speaker and create the manifest:
+
+```bash
+python -m minimoss.prepare_hf_dataset --output-dir data --count 10
+```
+
+This produces `data/manifest.jsonl` with one object per line:
 
 ```json
 {"id":"utt_0001","wav":"/absolute/path/utt_0001.wav","text":"Hello world."}
