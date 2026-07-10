@@ -3,9 +3,26 @@
 
 import argparse
 import json
+import random
 from pathlib import Path
 
 from datasets import Audio, load_dataset
+
+
+def split_records(records: list[dict], validation_count: int, seed: int):
+    """Return deterministic train/validation splits without changing the input."""
+    if validation_count < 0 or validation_count >= len(records):
+        raise ValueError("validation_count must be between 0 and count - 1")
+
+    shuffled = sorted(records, key=lambda record: record["id"])
+    random.Random(seed).shuffle(shuffled)
+    return shuffled[validation_count:], shuffled[:validation_count]
+
+
+def write_manifest(path: Path, records: list[dict]):
+    with path.open("w") as manifest:
+        for record in records:
+            manifest.write(json.dumps(record) + "\n")
 
 
 def main():
@@ -13,10 +30,14 @@ def main():
     parser.add_argument("--output-dir", default="data")
     parser.add_argument("--count", type=int, default=10)
     parser.add_argument("--speaker-id", default="3081")
+    parser.add_argument("--validation-count", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     if args.count <= 0:
         raise ValueError("--count must be positive")
+    if args.validation_count < 0 or args.validation_count >= args.count:
+        raise ValueError("--validation-count must be between 0 and count - 1")
 
     output_dir = Path(args.output_dir)
     wav_dir = output_dir / "wavs"
@@ -61,12 +82,20 @@ def main():
         )
 
     manifest_path = output_dir / "manifest.jsonl"
-    with manifest_path.open("w") as manifest:
-        for record in records:
-            manifest.write(json.dumps(record) + "\n")
+    write_manifest(manifest_path, records)
 
     print(f"Wrote {len(records)} single-speaker clips to {wav_dir}")
     print(f"Manifest: {manifest_path}")
+    if args.validation_count:
+        train_records, validation_records = split_records(
+            records, args.validation_count, args.seed
+        )
+        train_path = output_dir / "train_manifest.jsonl"
+        validation_path = output_dir / "validation_manifest.jsonl"
+        write_manifest(train_path, train_records)
+        write_manifest(validation_path, validation_records)
+        print(f"Train manifest: {train_path} ({len(train_records)} clips)")
+        print(f"Validation manifest: {validation_path} ({len(validation_records)} clips)")
 
 
 if __name__ == "__main__":

@@ -83,3 +83,55 @@ python -m minimoss.generate \
 Qwen and MOSS-Audio-Tokenizer remain frozen. Training updates the previous-frame
 conditioner, global-to-local projection, RVQ embeddings, grouped local decoder,
 and output heads.
+
+## 100-Utterance Validation Run
+
+Create a reproducible 90/10 split from a single speaker with enough clips:
+
+```bash
+python -m minimoss.prepare_hf_dataset \
+  --output-dir data100 \
+  --count 100 \
+  --speaker-id 84 \
+  --validation-count 10 \
+  --seed 42
+
+python -m minimoss.prepare_tokens \
+  --manifest data100/manifest.jsonl \
+  --token-dir data100/tokens \
+  --device cuda
+```
+
+Train only on the 90-item training manifest:
+
+```bash
+mkdir -p logs
+python -u -m minimoss.train_overfit \
+  --manifest data100/train_manifest.jsonl \
+  --token-dir data100/tokens \
+  --output-dir checkpoints/train_90 \
+  --batch-size 1 \
+  --max-steps 5000 \
+  --device cuda 2>&1 | tee logs/train_90.log
+```
+
+Evaluate the held-out ten items in one process:
+
+```bash
+python -m minimoss.evaluate \
+  --checkpoint checkpoints/train_90/final.pt \
+  --manifest data100/validation_manifest.jsonl \
+  --token-dir data100/tokens \
+  --output-dir evaluation/validation_10 \
+  --device cuda
+```
+
+The evaluator writes `01_ground_truth.wav`, `01_teacher.wav`, `01_free.wav`,
+and `01.txt` through item 10, plus `evaluation.jsonl` and `summary.json`. Listen
+to the ten `*_free.wav` files. Compare a corresponding ground-truth file only
+when the free output sounds wrong. Token accuracy is a regression diagnostic,
+not a perceptual audio score.
+
+This lean model does not predict duration or EOS. Validation free generation
+therefore uses each held-out sample's reference frame count. It tests acoustic
+token generalization, but not duration prediction.
