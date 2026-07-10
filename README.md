@@ -135,3 +135,85 @@ not a perceptual audio score.
 This lean model does not predict duration or EOS. Validation free generation
 therefore uses each held-out sample's reference frame count. It tests acoustic
 token generalization, but not duration prediction.
+
+## LJSpeech 1,000/100 Gate
+
+This is the next generalization experiment after the tiny LibriTTS-R gates. It
+keeps the architecture unchanged and uses 1,000 training plus 100 held-out
+single-speaker LJSpeech utterances. The preparation command uses the
+Parquet-backed `dinhbinh161/ljspeech` mirror because current `datasets`
+versions no longer execute the legacy loader in `keithito/lj_speech`.
+
+Prepare the deterministic split and verify its sizes:
+
+```bash
+python -m minimoss.prepare_ljspeech \
+  --output-dir data_ljspeech_1100 \
+  --train-count 1000 \
+  --validation-count 100 \
+  --seed 42
+
+wc -l \
+  data_ljspeech_1100/manifest.jsonl \
+  data_ljspeech_1100/train_manifest.jsonl \
+  data_ljspeech_1100/validation_manifest.jsonl
+```
+
+Tokenize all 1,100 clips once with the MOSS audio tokenizer:
+
+```bash
+python -u -m minimoss.prepare_tokens \
+  --manifest data_ljspeech_1100/manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --device cuda 2>&1 | tee logs/prepare_ljspeech_1100.log
+```
+
+Listen to `data_ljspeech_1100/tokens/_codec_check.wav` before training. Train
+with full held-out validation every 1,000 steps:
+
+```bash
+python -u -m minimoss.train_overfit \
+  --manifest data_ljspeech_1100/train_manifest.jsonl \
+  --validation-manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir checkpoints/ljspeech_1000 \
+  --batch-size 1 \
+  --max-steps 20000 \
+  --validate-every 1000 \
+  --device cuda 2>&1 | tee logs/train_ljspeech_1000.log
+```
+
+The trainer writes `best_validation.pt` whenever held-out loss improves. To
+resume an interrupted run, retain the original total `--max-steps`:
+
+```bash
+python -u -m minimoss.train_overfit \
+  --manifest data_ljspeech_1100/train_manifest.jsonl \
+  --validation-manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir checkpoints/ljspeech_1000 \
+  --batch-size 1 \
+  --max-steps 20000 \
+  --validate-every 1000 \
+  --resume checkpoints/ljspeech_1000/step_10000.pt \
+  --device cuda 2>&1 | tee -a logs/train_ljspeech_1000.log
+```
+
+Generate numbered audio for the first 20 held-out clips using the best
+validation checkpoint:
+
+```bash
+python -u -m minimoss.evaluate \
+  --checkpoint checkpoints/ljspeech_1000/best_validation.pt \
+  --manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir evaluation/ljspeech_validation_20 \
+  --limit 20 \
+  --device cuda 2>&1 | tee logs/evaluate_ljspeech_validation_20.log
+```
+
+Listen to `01_free.wav` through `20_free.wav`. Compare the corresponding
+teacher and ground-truth files when a free output fails. A successful gate has
+recognizable held-out target speech in teacher mode and at least partially
+stable target speech in free-running mode. Exact validation RVQ accuracy is a
+diagnostic, not a perceptual quality score.

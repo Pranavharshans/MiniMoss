@@ -12,6 +12,8 @@ Usage:
 import argparse
 import os
 import time
+from pathlib import Path
+
 import torch
 from torch.utils.data import DataLoader
 
@@ -21,14 +23,68 @@ from .dataset import MiniMossDataset, collate_fn
 from .utils import set_seed, format_metrics
 
 
+def weighted_loss(group_losses, weights):
+    return sum(weight * loss for weight, loss in zip(weights, group_losses)) / sum(weights)
+
+
+def trainable_state_dict(model):
+    """Return a checkpoint without duplicating the frozen Hugging Face backbone."""
+    return {key: value for key, value in model.state_dict().items() if not key.startswith("_backbone.")}
+
+
+def save_checkpoint(path, step, model, optimizer, scaler, config, best_validation_loss):
+    torch.save({
+        "step": step,
+        "model_state_dict": trainable_state_dict(model),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+        "config": config,
+        "best_validation_loss": best_validation_loss,
+    }, path)
+
+
+@torch.inference_mode()
+def validate(model, loader, device, weights, max_batches=None):
+    model.eval()
+    total_loss = 0.0
+    total_groups = [0.0] * len(weights)
+    batches = 0
+    for text, text_mask, rvq, audio_mask in loader:
+        text = text.to(device)
+        text_mask = text_mask.to(device)
+        rvq = rvq.to(device)
+        audio_mask = audio_mask.to(device)
+        _, group_losses = model(
+            text,
+            rvq,
+            text_attention_mask=text_mask,
+            audio_frame_mask=audio_mask,
+        )
+        total_loss += weighted_loss(group_losses, weights).item()
+        for index, loss in enumerate(group_losses):
+            total_groups[index] += loss.item()
+        batches += 1
+        if max_batches is not None and batches >= max_batches:
+            break
+    model.train()
+    if batches == 0:
+        raise ValueError("Validation loader produced no batches")
+    return total_loss / batches, [loss / batches for loss in total_groups]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train MiniMoss overfit test")
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--validation-manifest", default=None)
     parser.add_argument("--token-dir", required=True)
     parser.add_argument("--output-dir", default="./checkpoints")
     parser.add_argument("--overfit-one-batch", action="store_true",
                         help="Overfit a single batch for sanity check")
     parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--validate-every", type=int, default=1000)
+    parser.add_argument("--validation-batches", type=int, default=None,
+                        help="Limit validation batches; default evaluates the full manifest")
+    parser.add_argument("--resume", default=None, help="Resume from a training checkpoint")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--codec", default="OpenMOSS-Team/MOSS-Audio-Tokenizer",
@@ -58,6 +114,10 @@ def main():
     )
     if args.max_steps is not None:
         config.max_steps = args.max_steps
+    if args.validate_every <= 0:
+        raise ValueError("--validate-every must be positive")
+    if args.validation_batches is not None and args.validation_batches <= 0:
+        raise ValueError("--validation-batches must be positive")
 
     print("=" * 60)
     print("MiniMoss Overfit Training")
@@ -72,6 +132,8 @@ def main():
     print("  trainable: frame conditioner + projection + RVQ embeddings + local decoder + heads")
     print(f"  device: {args.device}")
     print(f"  overfit_one_batch: {args.overfit_one_batch}")
+    print(f"  validation_manifest: {args.validation_manifest}")
+    print(f"  resume: {args.resume}")
 
     # Dataset
     dataset = MiniMossDataset(
@@ -90,6 +152,23 @@ def main():
         collate_fn=collate_fn,
         drop_last=False,
     )
+    validation_loader = None
+    if args.validation_manifest:
+        validation_dataset = MiniMossDataset(
+            manifest_path=args.validation_manifest,
+            token_dir=args.token_dir,
+            max_frames=config.max_frames,
+            n_codebooks=config.n_codebooks,
+            codebook_size=config.codebook_size,
+        )
+        validation_loader = DataLoader(
+            validation_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            drop_last=False,
+        )
+        print(f"Validation dataset: {len(validation_dataset)} utterances")
 
     # Model
     print("\nLoading model...")
@@ -108,6 +187,19 @@ def main():
     optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler("cuda") if config.use_amp and args.device.startswith("cuda") else None
 
+    start_step = 0
+    best_validation_loss = float("inf")
+    if args.resume:
+        print(f"Resuming from: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if scaler is not None and checkpoint.get("scaler_state_dict") is not None:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        start_step = int(checkpoint["step"])
+        best_validation_loss = float(checkpoint.get("best_validation_loss", float("inf")))
+        print(f"  resumed at step {start_step}; best validation loss={best_validation_loss:.4f}")
+
     # Get one batch for overfit mode
     if args.overfit_one_batch:
         text_batch, mask_batch, rvq_batch, audio_mask_batch = next(iter(loader))
@@ -117,10 +209,6 @@ def main():
         audio_mask_batch = audio_mask_batch.to(args.device)
         print(f"  overfit batch: text={list(text_batch.shape)}, rvq={list(rvq_batch.shape)}")
 
-    def _trainable_state_dict(model):
-        """Return state_dict excluding the frozen backbone."""
-        return {k: v for k, v in model.state_dict().items() if not k.startswith("_backbone.")}
-
     # Training loop
     model.train()
     step = 0
@@ -128,13 +216,15 @@ def main():
     if args.overfit_one_batch:
         total_steps = 500  # enough to overfit one batch
 
-    print(f"\nTraining for {total_steps} steps...\n")
+    if start_step >= total_steps:
+        raise ValueError(f"Resume step {start_step} is already at or beyond max steps {total_steps}")
+    print(f"\nTraining from step {start_step + 1} through {total_steps}...\n")
 
     # Create iterator once, recreate on exhaustion
     if not args.overfit_one_batch:
         data_iter = iter(loader)
 
-    for step in range(1, total_steps + 1):
+    for step in range(start_step + 1, total_steps + 1):
         t_start = time.time()
 
         if args.overfit_one_batch:
@@ -173,7 +263,7 @@ def main():
 
         # Weighted total loss
         weights = config.group_loss_weights
-        total_loss = sum(w * gl for w, gl in zip(weights, group_losses)) / sum(weights)
+        total_loss = weighted_loss(group_losses, weights)
 
         # Backward
         optimizer.zero_grad()
@@ -195,25 +285,40 @@ def main():
             g_losses = [gl.item() for gl in group_losses]
             print(format_metrics(step, total_loss.item(), g_losses, config.learning_rate, step_time))
 
+        if validation_loader is not None and step % args.validate_every == 0:
+            validation_loss, validation_groups = validate(
+                model,
+                validation_loader,
+                args.device,
+                weights,
+                args.validation_batches,
+            )
+            group_text = " | ".join(
+                f"val_g{index + 1}={loss:.4f}"
+                for index, loss in enumerate(validation_groups)
+            )
+            print(f"validation step={step} | val_loss={validation_loss:.4f} | {group_text}")
+            if validation_loss < best_validation_loss:
+                best_validation_loss = validation_loss
+                best_path = Path(args.output_dir) / "best_validation.pt"
+                save_checkpoint(
+                    best_path, step, model, optimizer, scaler, config, best_validation_loss
+                )
+                print(f"  -> new best validation checkpoint: {best_path}")
+
         # Checkpoint
         if step % config.checkpoint_every == 0:
             ckpt_path = os.path.join(args.output_dir, f"step_{step}.pt")
-            torch.save({
-                "step": step,
-                "model_state_dict": _trainable_state_dict(model),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "config": config,
-            }, ckpt_path)
+            save_checkpoint(
+                ckpt_path, step, model, optimizer, scaler, config, best_validation_loss
+            )
             print(f"  -> saved {ckpt_path}")
 
     # Final checkpoint
     final_path = os.path.join(args.output_dir, "final.pt")
-    torch.save({
-        "step": step,
-        "model_state_dict": _trainable_state_dict(model),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "config": config,
-    }, final_path)
+    save_checkpoint(
+        final_path, step, model, optimizer, scaler, config, best_validation_loss
+    )
     print(f"\nFinal checkpoint: {final_path}")
     print("Done!")
 
