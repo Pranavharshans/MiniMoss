@@ -93,6 +93,65 @@ def decode(processor, codes: torch.Tensor, device: str):
     return waveform
 
 
+def select_token(logits: torch.Tensor, temperature: float, top_k: int):
+    if temperature <= 0:
+        return logits.argmax(dim=-1)
+    values, indices = logits.topk(min(top_k, logits.shape[-1]), dim=-1)
+    probabilities = torch.softmax(values.float() / temperature, dim=-1)
+    offsets = torch.multinomial(probabilities, 1)
+    return indices.gather(-1, offsets).squeeze(-1)
+
+
+@torch.inference_mode()
+def sequential_local_predict(
+    model,
+    states: torch.Tensor,
+    prefix_tokens: torch.Tensor,
+    batch_size: int,
+    temperature: float,
+    top_k: int,
+):
+    """Replay the official depth loop, feeding each generated codebook forward."""
+    parts = []
+    n_codebooks = model.config.n_vq
+    for start in range(0, states.shape[0], batch_size):
+        batch_states = states[start:start + batch_size].to(
+            device=model.device, dtype=model.dtype
+        )
+        batch_prefix = prefix_tokens[start:start + batch_size].to(model.device)
+        local_inputs = [model.speech_embedding_to_local_mlp(batch_states)]
+        local_inputs.append(
+            model.speech_embedding_to_local_mlp(
+                model.model.embedding_list[0](batch_prefix)
+            )
+        )
+        generated = torch.zeros(
+            (batch_states.shape[0], n_codebooks), dtype=torch.long, device=model.device
+        )
+        for codebook in range(n_codebooks):
+            local_hidden = model.local_transformer(
+                input_ids=None,
+                attention_mask=None,
+                inputs_embeds=torch.stack(local_inputs, dim=1),
+                return_dict=True,
+            ).last_hidden_state[:, -1]
+            channel = codebook + 1
+            hidden = model.layer_norm_before_lm_heads[channel](
+                model.local_to_speech_embedding_mlps[channel](local_hidden)
+            )
+            logits = model.lm_heads[channel](hidden)[..., :model.config.audio_vocab_size]
+            token = select_token(logits, temperature, top_k)
+            generated[:, codebook] = token
+            if codebook + 1 < n_codebooks:
+                local_inputs.append(
+                    model.speech_embedding_to_local_mlp(
+                        model.model.embedding_list[channel](token)
+                    )
+                )
+        parts.append(generated.cpu())
+    return torch.cat(parts)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True)
@@ -104,12 +163,18 @@ def main():
     parser.add_argument("--max-frames", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--audio-limit", type=int, default=3)
+    parser.add_argument("--sequential-temperature", type=float, default=1.0)
+    parser.add_argument("--sequential-top-k", type=int, default=50)
     parser.add_argument("--min-loss-improvement", type=float, default=0.01)
     parser.add_argument("--min-accuracy-improvement", type=float, default=0.002)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     if min(args.limit, args.max_frames, args.batch_size) <= 0:
         raise ValueError("--limit, --max-frames, and --batch-size must be positive")
+    if args.sequential_temperature < 0 or args.sequential_top_k <= 0:
+        raise ValueError("Sequential temperature must be non-negative and top-k positive")
+    torch.manual_seed(args.seed)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -149,10 +214,32 @@ def main():
         observed = predict_prefix_mode(
             model, states, targets, observed_prefix, args.batch_size
         )
+        sequential_greedy = sequential_local_predict(
+            model,
+            states,
+            observed_prefix,
+            args.batch_size,
+            temperature=0.0,
+            top_k=args.sequential_top_k,
+        )
+        sequential_sampled = sequential_local_predict(
+            model,
+            states,
+            observed_prefix,
+            args.batch_size,
+            temperature=args.sequential_temperature,
+            top_k=args.sequential_top_k,
+        )
         fixed_stats.append(fixed)
         observed_stats.append(observed)
         loss_improvement = fixed["loss"] - observed["loss"]
         accuracy_improvement = observed["token_accuracy"] - fixed["token_accuracy"]
+        sequential_greedy_accuracy = float(
+            sequential_greedy.eq(targets).float().mean()
+        )
+        sequential_sampled_accuracy = float(
+            sequential_sampled.eq(targets).float().mean()
+        )
         result = {
             "id": item["id"],
             "text": item["text"],
@@ -165,6 +252,8 @@ def main():
             "fixed_token_accuracy": fixed["token_accuracy"],
             "observed_token_accuracy": observed["token_accuracy"],
             "accuracy_improvement": accuracy_improvement,
+            "sequential_greedy_token_accuracy": sequential_greedy_accuracy,
+            "sequential_sampled_token_accuracy": sequential_sampled_accuracy,
             "status": (
                 "PASS"
                 if loss_improvement >= args.min_loss_improvement
@@ -177,7 +266,9 @@ def main():
             f"[{index:02d}/{len(items):02d}] {item['id']} | "
             f"fixed_loss={fixed['loss']:.4f} observed_loss={observed['loss']:.4f} | "
             f"fixed_acc={fixed['token_accuracy']:.4f} "
-            f"observed_acc={observed['token_accuracy']:.4f} | {result['status']}"
+            f"observed_acc={observed['token_accuracy']:.4f} | "
+            f"seq_greedy_acc={sequential_greedy_accuracy:.4f} | "
+            f"seq_sampled_acc={sequential_sampled_accuracy:.4f} | {result['status']}"
         )
 
         if index <= args.audio_limit:
@@ -185,6 +276,8 @@ def main():
                 ("ground_truth", targets),
                 ("teacher_fixed_prefix", fixed["predictions"]),
                 ("teacher_observed_prefix", observed["predictions"]),
+                ("teacher_sequential_greedy", sequential_greedy),
+                ("teacher_sequential_sampled", sequential_sampled),
             )
             for name, codes in audio_outputs:
                 torchaudio.save(
@@ -211,6 +304,14 @@ def main():
         - weighted_mean(observed_stats, "loss"),
         "accuracy_improvement": weighted_mean(observed_stats, "token_accuracy")
         - weighted_mean(fixed_stats, "token_accuracy"),
+        "sequential_greedy_token_accuracy": sum(
+            result["sequential_greedy_token_accuracy"] * result["frames"]
+            for result in utterance_results
+        ) / sum(result["frames"] for result in utterance_results),
+        "sequential_sampled_token_accuracy": sum(
+            result["sequential_sampled_token_accuracy"] * result["frames"]
+            for result in utterance_results
+        ) / sum(result["frames"] for result in utterance_results),
         "results": utterance_results,
         "audio_dir": str(audio_dir),
     }

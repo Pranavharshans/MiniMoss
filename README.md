@@ -614,7 +614,8 @@ not a sequential on-policy MOSS rollout.
 
 Before retraining the student, test whether the fixed channel-0 slot token was
 causing the noisy teacher. The probe compares the old fixed prefix against the
-actual per-frame channel-0 prefix and writes numbered audio for both paths.
+actual per-frame channel-0 prefix, then replays the local decoder sequentially
+with greedy and top-k sampling. It writes numbered audio for all paths.
 
 ```bash
 python -u -m minimoss.probe_moss_local_alignment \
