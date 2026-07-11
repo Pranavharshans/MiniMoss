@@ -226,6 +226,11 @@ def main():
     parser.add_argument("--train-cache", required=True)
     parser.add_argument("--validation-cache", required=True)
     parser.add_argument("--output-dir", default="checkpoints/moss_grouped_hybrid11")
+    parser.add_argument(
+        "--resume-checkpoint",
+        default=None,
+        help="Resume model weights and global step from a previous best.pt",
+    )
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--eval-batch-size", type=int, default=1024)
@@ -335,6 +340,15 @@ def main():
         groups=spec["groups"],
     )
     model = GroupedLocalStudent(config).to(args.device)
+    resume_step = 0
+    resume_checkpoint = None
+    if args.resume_checkpoint is not None:
+        resume_checkpoint = torch.load(
+            args.resume_checkpoint, map_location=args.device, weights_only=False
+        )
+        model.load_state_dict(resume_checkpoint["model_state_dict"])
+        resume_step = int(resume_checkpoint.get("step", 0))
+        print(f"resuming from: {args.resume_checkpoint} | step={resume_step}")
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
@@ -348,16 +362,32 @@ def main():
         f"gt_weight={ground_truth_weight} | kd_weight={distillation_weight} | "
         f"rollout_weight={rollout_weight}"
     )
-    best_loss = float("inf")
-    best_step = 0
-    best_state = None
-    best_validation_loss = None
-    best_validation_rollout_loss = None
-    best_validation_ground_truth_loss = None
-    best_validation_distillation_loss = None
-    best_validation_channel_losses = None
+    best_loss = float("inf") if resume_checkpoint is None else float(
+        resume_checkpoint.get(
+            "selection_loss", resume_checkpoint.get("validation_loss", float("inf"))
+        )
+    )
+    best_step = 0 if resume_checkpoint is None else resume_step
+    best_state = None if resume_checkpoint is None else copy.deepcopy(model.state_dict())
+    best_validation_loss = None if resume_checkpoint is None else resume_checkpoint.get(
+        "validation_loss"
+    )
+    best_validation_rollout_loss = (
+        None
+        if resume_checkpoint is None
+        else resume_checkpoint.get("validation_rollout_loss")
+    )
+    best_validation_ground_truth_loss = None if resume_checkpoint is None else resume_checkpoint.get(
+        "validation_ground_truth_loss"
+    )
+    best_validation_distillation_loss = None if resume_checkpoint is None else resume_checkpoint.get(
+        "validation_distillation_loss"
+    )
+    best_validation_channel_losses = None if resume_checkpoint is None else resume_checkpoint.get(
+        "validation_channel_losses"
+    )
     checks_without_improvement = 0
-    for step in range(1, args.max_steps + 1):
+    for step in range(resume_step + 1, args.max_steps + 1):
         started = time.time()
         indices = torch.randint(
             train_states.shape[0], (args.batch_size,), generator=generator
@@ -490,6 +520,9 @@ def main():
                     "validation_loss": val_loss,
                     "validation_rollout_loss": val_rollout,
                     "selection_loss": selection_loss,
+                    "validation_ground_truth_loss": val_gt,
+                    "validation_distillation_loss": val_kd,
+                    "validation_channel_losses": channel_losses,
                 }, output_dir / "best.pt")
                 print(f"  -> new best checkpoint at step {step}")
             else:

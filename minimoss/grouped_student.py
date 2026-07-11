@@ -278,7 +278,9 @@ class GroupedLocalStudent(nn.Module):
                 predictions[:, codebook] = logits.detach().argmax(dim=-1)
             if group_index + 1 < len(self.config.groups):
                 if teacher_forcing_probability <= 0.0:
-                    context = predictions
+                    # Embedding backward saves integer indices. Snapshot the
+                    # context before the next group's predictions mutate it.
+                    context = predictions.clone()
                 elif teacher_forcing_probability >= 1.0:
                     context = targets
                 else:
