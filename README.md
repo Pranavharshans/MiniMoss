@@ -548,6 +548,9 @@ states for 200 training and 20 held-out utterances, trains a small probe for
 RVQ codebooks 1-4, and writes hybrid audio with predicted codebooks 1-4 plus
 ground-truth codebooks 5-32.
 
+The loader pins the official model and its remote Python implementation to
+revision `12aa734e4f11a7b3fdf4eb0ad2aa2029675ffc2e`.
+
 ```bash
 python -u -m minimoss.validate_moss_teacher \
   --train-manifest data_ljspeech_1100/train_manifest.jsonl \

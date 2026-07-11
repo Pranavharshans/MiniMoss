@@ -17,6 +17,7 @@ from .utils import set_seed
 
 
 DEFAULT_MODEL = "OpenMOSS-Team/MOSS-TTS-Local-Transformer"
+DEFAULT_REVISION = "12aa734e4f11a7b3fdf4eb0ad2aa2029675ffc2e"
 
 
 class CoarseStateProbe(nn.Module):
@@ -55,21 +56,17 @@ def probe_loss(logits: list[torch.Tensor], targets: torch.Tensor) -> torch.Tenso
 
 def pack_teacher_forcing(processor, text: str, rvq: torch.Tensor, device: str):
     user = processor.build_user_message(text=text, language="en")
-    prompt = processor([[user]], mode="generation", n_vq=rvq.shape[1])
     assistant = processor.build_assistant_message(audio_codes_list=[rvq])
     packed = processor(
-        [[user, assistant]], mode="computing_loss", n_vq=rvq.shape[1]
+        [[user, assistant]], mode="continuation", n_vq=rvq.shape[1]
     )
     full_ids = packed["input_ids"].to(device)
-    prompt_length = int(prompt["input_ids"][0].shape[0])
     input_ids = full_ids[:, :-1].contiguous()
     targets = full_ids[:, 1:].contiguous()
     attention_mask = torch.ones(
         input_ids.shape[:2], dtype=torch.bool, device=input_ids.device
     )
-    positions = torch.arange(targets.shape[1], device=targets.device)
-    assistant_mask = positions >= prompt_length - 1
-    valid_mask = assistant_mask[None] & valid_audio_target_mask(
+    valid_mask = valid_audio_target_mask(
         targets, processor.model_config.audio_pad_code
     )
     return input_ids, attention_mask, targets, valid_mask
@@ -249,6 +246,7 @@ def save_hybrid_audio(args, processor, validation_cache, predictions):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--revision", default=DEFAULT_REVISION)
     parser.add_argument("--train-manifest", required=True)
     parser.add_argument("--validation-manifest", required=True)
     parser.add_argument("--token-dir", required=True)
@@ -281,9 +279,16 @@ def main():
 
     dtype = torch.bfloat16 if args.device.startswith("cuda") else torch.float32
     print(f"Loading official MOSS teacher: {args.model}")
-    processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(
+        args.model,
+        revision=args.revision,
+        trust_remote_code=True,
+    )
     model = AutoModel.from_pretrained(
-        args.model, trust_remote_code=True, torch_dtype=dtype
+        args.model,
+        revision=args.revision,
+        trust_remote_code=True,
+        torch_dtype=dtype,
     ).to(args.device)
     model.eval()
     train_items = load_manifest(args.train_manifest)[:args.train_limit]
