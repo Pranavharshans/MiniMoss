@@ -36,6 +36,7 @@ def generate(
     max_frames: int = 200,
     temperature: float = 0.0,
     device: str = "cuda",
+    use_audio_context: bool = True,
 ) -> torch.Tensor:
     """Free-running autoregressive generation.
 
@@ -68,6 +69,7 @@ def generate(
             text_tokens,
             frame_context,
             text_attention_mask=text_mask,
+            audio_context_dropout_prob=0.0 if use_audio_context else 1.0,
         )[:, -1, :]
 
         # Decoder input starts with frame hidden
@@ -112,6 +114,7 @@ def teacher_forced_generate(
     codec: AudioCodec,
     token_path: str,
     device: str = "cuda",
+    use_audio_context: bool = True,
 ) -> torch.Tensor:
     """Teacher-forced: use ground-truth audio codes as decoder input, decode the model's predictions.
 
@@ -135,6 +138,7 @@ def teacher_forced_generate(
         text_tokens,
         rvq_gt,
         text_attention_mask=text_mask,
+        audio_context_dropout_prob=0.0 if use_audio_context else 1.0,
     )
 
     all_codes = []
@@ -178,6 +182,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--teacher-forced", default=None,
                         help="Path to pre-tokenized .pt file for teacher-forced generation")
+    parser.add_argument("--no-audio-context", action="store_true",
+                        help="Use the learned null previous-frame context")
     parser.add_argument("--output", default="generated.wav")
     parser.add_argument("--codec-name", default=None,
                         help="Defaults to checkpoint config.codec_name")
@@ -216,7 +222,10 @@ def main():
 
     if args.teacher_forced:
         print(f"Teacher-forced generation from: {args.teacher_forced}")
-        codes = teacher_forced_generate(model, codec, args.teacher_forced, device=args.device)
+        codes = teacher_forced_generate(
+            model, codec, args.teacher_forced, device=args.device,
+            use_audio_context=not args.no_audio_context,
+        )
     elif args.text:
         print(f"Generating: \"{args.text}\"")
         codes = generate(
@@ -225,6 +234,7 @@ def main():
             max_frames=args.max_frames,
             temperature=args.temperature,
             device=args.device,
+            use_audio_context=not args.no_audio_context,
         )
     else:
         print("ERROR: provide --text or --teacher-forced")

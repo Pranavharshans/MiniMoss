@@ -50,6 +50,8 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--no-audio-context", action="store_true",
+                        help="Use the learned null previous-frame context")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -89,9 +91,13 @@ def main():
         frames = target.shape[0]
         print(f"[{prefix}/{len(items):02d}] {item['id']} | {frames} frames | {text}")
 
-        teacher = teacher_forced_generate(model, codec, str(token_path), args.device)
+        teacher = teacher_forced_generate(
+            model, codec, str(token_path), args.device,
+            use_audio_context=not args.no_audio_context,
+        )
         free = generate(
-            model, tokenizer, codec, text, frames, args.temperature, args.device
+            model, tokenizer, codec, text, frames, args.temperature, args.device,
+            use_audio_context=not args.no_audio_context,
         )
         save_codes(codec, target, output_dir / f"{prefix}_ground_truth.wav", args.device)
         save_codes(codec, teacher, output_dir / f"{prefix}_teacher.wav", args.device)
@@ -103,6 +109,7 @@ def main():
             "text": text,
             "frames": frames,
             "free_uses_reference_frame_count": True,
+            "uses_audio_context": not args.no_audio_context,
             "teacher": token_metrics(teacher, target, config.codebooks_per_group),
             "free": token_metrics(free, target, config.codebooks_per_group),
         }
@@ -124,6 +131,7 @@ def main():
         "mean_free_token_accuracy": sum(r["free"]["token_accuracy"] for r in results) / len(results),
         "mean_free_frame_accuracy": sum(r["free"]["frame_accuracy"] for r in results) / len(results),
         "free_uses_reference_frame_count": True,
+        "uses_audio_context": not args.no_audio_context,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
