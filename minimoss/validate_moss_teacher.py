@@ -85,6 +85,7 @@ def extract_split(model, processor, items, token_dir: Path, device: str):
         outputs = model.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            n_vq_for_inference=processor.model_config.n_vq,
             output_hidden_states=False,
             use_cache=False,
             return_dict=True,
