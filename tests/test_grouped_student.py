@@ -37,6 +37,7 @@ def test_experiment_matrix_has_five_valid_layouts():
         "kd_only11",
         "adjacent16",
         "large11",
+        "rollout11",
     }
     assert len(ADJACENT2_GROUPS) == 16
     for name in EXPERIMENT_SPECS:
@@ -86,6 +87,23 @@ def test_topk_distillation_loss_backpropagates():
 
     assert torch.isfinite(ground_truth)
     assert torch.isfinite(distillation)
+    assert model.output_heads[0].weight.grad is not None
+
+
+def test_rollout_loss_backpropagates_under_free_context():
+    model = GroupedLocalStudent(tiny_config())
+    states = torch.randn(5, 12)
+    targets = torch.randint(0, 8, (5, 4))
+
+    loss, channel_losses = model.rollout_loss(
+        states,
+        targets,
+        teacher_forcing_probability=0.0,
+    )
+    loss.backward()
+
+    assert len(channel_losses) == 4
+    assert torch.isfinite(loss)
     assert model.output_heads[0].weight.grad is not None
 
 

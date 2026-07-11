@@ -81,6 +81,20 @@ EXPERIMENT_SPECS = {
         "distillation_weight": 0.5,
         "label_smoothing": 0.02,
     },
+    "rollout11": {
+        "description": "Coarse-first student with scheduled free-running group contexts",
+        "groups": COARSE_FIRST_GROUPS,
+        "local_hidden_size": 512,
+        "local_num_layers": 4,
+        "local_ffn_hidden_size": 1024,
+        "ground_truth_weight": 0.5,
+        "distillation_weight": 0.5,
+        "label_smoothing": 0.02,
+        "rollout_weight": 0.5,
+        "rollout_teacher_forcing_start": 1.0,
+        "rollout_teacher_forcing_end": 0.0,
+        "rollout_ramp_steps": 2000,
+    },
 }
 
 
@@ -232,6 +246,48 @@ class GroupedLocalStudent(nn.Module):
         )
         total = ground_truth_weight * ground_truth_loss + distillation_weight * teacher_loss
         return total, ground_truth_loss, teacher_loss, channel_losses
+
+    def rollout_loss(
+        self,
+        global_states: torch.Tensor,
+        targets: torch.Tensor,
+        teacher_forcing_probability: float = 0.0,
+        label_smoothing: float = 0.0,
+    ):
+        """Train later groups under the prefixes free decoding will produce."""
+        if not 0.0 <= teacher_forcing_probability <= 1.0:
+            raise ValueError("teacher_forcing_probability must be in [0, 1]")
+        inputs = [self.global_projection(global_states)]
+        channel_losses = []
+        predictions = torch.zeros_like(targets)
+        for group_index, group in enumerate(self.config.groups):
+            decoder_input = torch.stack(inputs, dim=1)
+            positions = torch.arange(
+                len(inputs), device=decoder_input.device
+            ).unsqueeze(0)
+            hidden = self.local_decoder(decoder_input, position_ids=positions)[:, -1]
+            for codebook in group:
+                logits = self.output_heads[codebook](hidden)
+                channel_losses.append(
+                    F.cross_entropy(
+                        logits,
+                        targets[:, codebook],
+                        label_smoothing=label_smoothing,
+                    )
+                )
+                predictions[:, codebook] = logits.detach().argmax(dim=-1)
+            if group_index + 1 < len(self.config.groups):
+                if teacher_forcing_probability <= 0.0:
+                    context = predictions
+                elif teacher_forcing_probability >= 1.0:
+                    context = targets
+                else:
+                    use_teacher = torch.rand(
+                        (targets.shape[0], 1), device=targets.device
+                    ) < teacher_forcing_probability
+                    context = torch.where(use_teacher, targets, predictions)
+                inputs.append(self.embed_group(context, group))
+        return torch.stack(channel_losses).mean(), channel_losses
 
     @torch.inference_mode()
     def predict(

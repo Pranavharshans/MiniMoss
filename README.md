@@ -696,7 +696,8 @@ student-sampled audio under `checkpoints/moss_grouped_hybrid11_distilled/audio`.
 
 ### Five-Variant Experiment Matrix
 
-The grouped student trainer contains five presets that use the same cached MOSS
+The grouped student trainer contains five comparison presets plus a rollout
+training preset that use the same cached MOSS
 states and the same validation split. This makes the comparison useful: only
 the loss objective, grouping schedule, or local capacity changes. Run each
 command independently; each writes to its own directory.
@@ -756,6 +757,19 @@ python -u -m minimoss.train_grouped_student \
   2>&1 | tee logs/moss_experiment_large11.log
 ```
 
+After the sequential replay probe, run the scheduled free-running student:
+
+```bash
+python -u -m minimoss.train_grouped_student \
+  --variant rollout11 \
+  --train-cache evaluation/moss_teacher_distillation/train_distill.pt \
+  --validation-cache evaluation/moss_teacher_distillation/validation_distill.pt \
+  --output-dir checkpoints/moss_experiments/rollout11 \
+  --batch-size 512 --eval-batch-size 1024 --max-steps 5000 \
+  --validate-every 100 --audio-limit 10 --device cuda \
+  2>&1 | tee logs/moss_experiment_rollout11.log
+```
+
 After any subset or all five runs finish, collect the numeric comparison and
 audio locations with:
 
@@ -773,3 +787,5 @@ current failure is capacity-limited; it is roughly 90M parameters. Select a
 candidate using free-running audio first, then free token accuracy and teacher
 agreement as diagnostics. Weighted validation losses from the three objective
 variants are not directly comparable.
+`rollout11` is the next-stage test: it gradually replaces teacher-forced group
+prefixes with the student's own predicted prefixes during training.

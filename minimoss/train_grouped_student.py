@@ -91,6 +91,34 @@ def validation_loss(
     )
 
 
+@torch.inference_mode()
+def validation_rollout_loss(
+    model,
+    states,
+    targets,
+    device: str,
+    batch_size: int,
+    teacher_forcing_probability: float,
+    label_smoothing: float,
+):
+    model.eval()
+    total = 0.0
+    count = 0
+    for start in range(0, states.shape[0], batch_size):
+        batch_states = states[start:start + batch_size].to(device)
+        batch_targets = targets[start:start + batch_size].to(device)
+        loss, _ = model.rollout_loss(
+            batch_states,
+            batch_targets,
+            teacher_forcing_probability=teacher_forcing_probability,
+            label_smoothing=label_smoothing,
+        )
+        size = batch_states.shape[0]
+        total += float(loss) * size
+        count += size
+    return total / count
+
+
 def group_accuracies(predictions, targets, groups):
     matches = predictions.eq(targets)
     return [
@@ -207,6 +235,10 @@ def main():
     parser.add_argument("--ground-truth-weight", type=float, default=None)
     parser.add_argument("--distillation-weight", type=float, default=None)
     parser.add_argument("--distillation-temperature", type=float, default=2.0)
+    parser.add_argument("--rollout-weight", type=float, default=None)
+    parser.add_argument("--rollout-teacher-forcing-start", type=float, default=None)
+    parser.add_argument("--rollout-teacher-forcing-end", type=float, default=None)
+    parser.add_argument("--rollout-ramp-steps", type=int, default=None)
     parser.add_argument("--validate-every", type=int, default=100)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--min-delta", type=float, default=0.005)
@@ -251,6 +283,14 @@ def main():
         if args.local_ffn_size is None
         else args.local_ffn_size
     )
+    rollout_weight = spec.get("rollout_weight", 0.0) if args.rollout_weight is None else args.rollout_weight
+    rollout_teacher_forcing_start = spec.get(
+        "rollout_teacher_forcing_start", 1.0
+    ) if args.rollout_teacher_forcing_start is None else args.rollout_teacher_forcing_start
+    rollout_teacher_forcing_end = spec.get(
+        "rollout_teacher_forcing_end", 0.0
+    ) if args.rollout_teacher_forcing_end is None else args.rollout_teacher_forcing_end
+    rollout_ramp_steps = spec.get("rollout_ramp_steps", 0) if args.rollout_ramp_steps is None else args.rollout_ramp_steps
     set_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -280,6 +320,12 @@ def main():
         raise ValueError("Loss weights cannot be negative")
     if ground_truth_weight + distillation_weight <= 0:
         raise ValueError("At least one loss weight must be positive")
+    if not 0.0 <= rollout_weight <= 1.0:
+        raise ValueError("rollout_weight must be in [0, 1]")
+    if not 0.0 <= rollout_teacher_forcing_start <= 1.0 or not 0.0 <= rollout_teacher_forcing_end <= 1.0:
+        raise ValueError("rollout teacher-forcing probabilities must be in [0, 1]")
+    if rollout_ramp_steps < 0:
+        raise ValueError("rollout_ramp_steps cannot be negative")
     config = GroupedStudentConfig(
         global_hidden_size=train_states.shape[1],
         local_hidden_size=local_hidden_size,
@@ -299,11 +345,14 @@ def main():
     print(f"train frames: {train_states.shape[0]} | validation frames: {validation_states.shape[0]}")
     print(
         f"student parameters: {trainable:,} | local steps/frame: {len(config.groups)} | "
-        f"gt_weight={ground_truth_weight} | kd_weight={distillation_weight}"
+        f"gt_weight={ground_truth_weight} | kd_weight={distillation_weight} | "
+        f"rollout_weight={rollout_weight}"
     )
     best_loss = float("inf")
     best_step = 0
     best_state = None
+    best_validation_loss = None
+    best_validation_rollout_loss = None
     best_validation_ground_truth_loss = None
     best_validation_distillation_loss = None
     best_validation_channel_losses = None
@@ -317,11 +366,20 @@ def main():
         targets = train_targets[indices].to(args.device)
         teacher_indices = train_teacher_indices[indices].to(args.device)
         teacher_values = train_teacher_values[indices].to(args.device)
+        if rollout_ramp_steps == 0:
+            rollout_probability = rollout_teacher_forcing_end
+        else:
+            progress = min(step / rollout_ramp_steps, 1.0)
+            rollout_probability = (
+                rollout_teacher_forcing_start
+                + progress
+                * (rollout_teacher_forcing_end - rollout_teacher_forcing_start)
+            )
         model.train()
         optimizer.zero_grad()
         if scaler is not None:
             with torch.amp.autocast("cuda"):
-                loss, ground_truth_loss, teacher_loss, _ = model.combined_loss(
+                base_loss, ground_truth_loss, teacher_loss, _ = model.combined_loss(
                     states,
                     targets,
                     teacher_indices,
@@ -331,13 +389,23 @@ def main():
                     args.distillation_temperature,
                     label_smoothing,
                 )
+                if rollout_weight > 0.0:
+                    rollout_training_loss, _ = model.rollout_loss(
+                        states,
+                        targets,
+                        teacher_forcing_probability=rollout_probability,
+                        label_smoothing=label_smoothing,
+                    )
+                    loss = (1.0 - rollout_weight) * base_loss + rollout_weight * rollout_training_loss
+                else:
+                    rollout_training_loss = base_loss.detach() * 0.0
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
-            loss, ground_truth_loss, teacher_loss, _ = model.combined_loss(
+            base_loss, ground_truth_loss, teacher_loss, _ = model.combined_loss(
                 states,
                 targets,
                 teacher_indices,
@@ -347,6 +415,16 @@ def main():
                 args.distillation_temperature,
                 label_smoothing,
             )
+            if rollout_weight > 0.0:
+                rollout_training_loss, _ = model.rollout_loss(
+                    states,
+                    targets,
+                    teacher_forcing_probability=rollout_probability,
+                    label_smoothing=label_smoothing,
+                )
+                loss = (1.0 - rollout_weight) * base_loss + rollout_weight * rollout_training_loss
+            else:
+                rollout_training_loss = base_loss.detach() * 0.0
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -354,7 +432,9 @@ def main():
             print(
                 f"step={step} | loss={loss.item():.4f} | "
                 f"gt={ground_truth_loss.item():.4f} | "
-                f"kd={teacher_loss.item():.4f} | t={time.time() - started:.2f}s"
+                f"kd={teacher_loss.item():.4f} | "
+                f"rollout={rollout_training_loss.item():.4f} | "
+                f"rollout_p={rollout_probability:.3f} | t={time.time() - started:.2f}s"
             )
         if step % args.validate_every == 0:
             val_loss, val_gt, val_kd, channel_losses = validation_loss(
@@ -375,10 +455,29 @@ def main():
                 f"cb1={channel_losses[0]:.4f} | cb4={channel_losses[3]:.4f} | "
                 f"cb32={channel_losses[-1]:.4f}"
             )
-            if val_loss < best_loss - args.min_delta:
-                best_loss = val_loss
+            val_rollout = None
+            selection_loss = val_loss
+            if rollout_weight > 0.0:
+                val_rollout = validation_rollout_loss(
+                    model,
+                    validation_states,
+                    validation_targets,
+                    args.device,
+                    args.eval_batch_size,
+                    teacher_forcing_probability=0.0,
+                    label_smoothing=label_smoothing,
+                )
+                selection_loss = (1.0 - rollout_weight) * val_loss + rollout_weight * val_rollout
+                print(
+                    f"validation rollout step={step} | loss={val_rollout:.4f} | "
+                    f"selection={selection_loss:.4f}"
+                )
+            if selection_loss < best_loss - args.min_delta:
+                best_loss = selection_loss
                 best_step = step
                 best_state = copy.deepcopy(model.state_dict())
+                best_validation_loss = val_loss
+                best_validation_rollout_loss = val_rollout
                 best_validation_ground_truth_loss = val_gt
                 best_validation_distillation_loss = val_kd
                 best_validation_channel_losses = channel_losses
@@ -389,6 +488,8 @@ def main():
                     "variant": args.variant,
                     "step": step,
                     "validation_loss": val_loss,
+                    "validation_rollout_loss": val_rollout,
+                    "selection_loss": selection_loss,
                 }, output_dir / "best.pt")
                 print(f"  -> new best checkpoint at step {step}")
             else:
@@ -403,7 +504,9 @@ def main():
         "experiment": args.variant,
         "description": spec["description"],
         "best_step": best_step,
-        "best_validation_loss": best_loss,
+        "best_validation_loss": best_validation_loss,
+        "best_validation_selection_loss": best_loss,
+        "best_validation_rollout_loss": best_validation_rollout_loss,
         "best_validation_ground_truth_loss": best_validation_ground_truth_loss,
         "best_validation_distillation_loss": best_validation_distillation_loss,
         "best_validation_channel_losses": best_validation_channel_losses,
@@ -413,6 +516,10 @@ def main():
         "ground_truth_weight": ground_truth_weight,
         "distillation_weight": distillation_weight,
         "distillation_temperature": args.distillation_temperature,
+        "rollout_weight": rollout_weight,
+        "rollout_teacher_forcing_start": rollout_teacher_forcing_start,
+        "rollout_teacher_forcing_end": rollout_teacher_forcing_end,
+        "rollout_ramp_steps": rollout_ramp_steps,
         "label_smoothing": label_smoothing,
         "local_hidden_size": local_hidden_size,
         "local_layers": local_layers,

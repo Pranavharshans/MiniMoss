@@ -42,6 +42,12 @@ def load_rows(root: Path):
             "local_steps_per_frame": summary.get("local_steps_per_frame"),
             "best_step": summary.get("best_step"),
             "best_validation_loss": summary.get("best_validation_loss"),
+            "best_validation_selection_loss": summary.get(
+                "best_validation_selection_loss"
+            ),
+            "best_validation_rollout_loss": summary.get(
+                "best_validation_rollout_loss"
+            ),
             "best_validation_ground_truth_loss": summary.get(
                 "best_validation_ground_truth_loss"
             ),
@@ -57,14 +63,15 @@ def load_rows(root: Path):
             "student_free_teacher_agreement": summary.get(
                 "student_free_teacher_agreement"
             ),
+            "rollout_weight": summary.get("rollout_weight", 0.0),
         })
     return rows, missing
 
 
 def print_table(rows, missing):
     print(
-        "experiment       status  params(M) steps  val_loss  val_gt  val_kd  "
-        "teacher_acc  free_acc  student_teacher"
+        "experiment       status  params(M) steps  val_loss  rollout  val_gt  "
+        "val_kd  teacher_acc  free_acc  student_teacher"
     )
     print("-" * 112)
     for row in rows:
@@ -73,6 +80,7 @@ def print_table(rows, missing):
             f"{_millions(row['student_parameters']):>8} "
             f"{str(row['local_steps_per_frame'] or '-'):>5} "
             f"{_number(row['best_validation_loss']):>9} "
+            f"{_number(row['best_validation_rollout_loss']):>7} "
             f"{_number(row['best_validation_ground_truth_loss']):>7} "
             f"{_number(row['best_validation_distillation_loss']):>7} "
             f"{_number(row['teacher_token_accuracy']):>11} "
