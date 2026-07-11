@@ -330,6 +330,7 @@ def main():
     parser.add_argument("--control-limit", type=int, default=3)
     parser.add_argument("--control-max-new-tokens", type=int, default=512)
     parser.add_argument("--reuse-cache", action="store_true")
+    parser.add_argument("--extract-only", action="store_true")
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -391,6 +392,11 @@ def main():
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    if args.extract_only:
+        print(f"Saved training states: {train_cache_path}")
+        print(f"Saved validation states: {validation_cache_path}")
+        return
 
     probe, metrics, predictions = train_probe(args, train_cache, validation_cache)
     torch.save({

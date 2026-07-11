@@ -585,3 +585,47 @@ python -u -m minimoss.validate_moss_teacher \
   --probe-steps 2000 \
   --device cuda 2>&1 | tee logs/retrain_moss_teacher_probe.log
 ```
+
+## Coarse-First Grouped Student
+
+After the planner probe passes, cache all 1,000 training and 100 validation
+utterances without running another probe:
+
+```bash
+python -u -m minimoss.validate_moss_teacher \
+  --train-manifest data_ljspeech_1100/train_manifest.jsonl \
+  --validation-manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir evaluation/moss_teacher_states_1000 \
+  --train-limit 1000 \
+  --validation-limit 100 \
+  --control-limit 1 \
+  --extract-only \
+  --device cuda 2>&1 | tee logs/extract_moss_teacher_states_1000.log
+```
+
+Train the 43.5M-parameter coarse-first student from those cached states:
+
+```bash
+python -u -m minimoss.train_grouped_student \
+  --train-cache evaluation/moss_teacher_states_1000/train_states.pt \
+  --validation-cache evaluation/moss_teacher_states_1000/validation_states.pt \
+  --output-dir checkpoints/moss_grouped_hybrid11 \
+  --batch-size 512 \
+  --max-steps 5000 \
+  --validate-every 100 \
+  --device cuda 2>&1 | tee logs/train_moss_grouped_hybrid11.log
+```
+
+The student predicts codebooks 1-4 in four sequential steps, then predicts
+codebooks 5-32 in seven groups of four. This is 11 local autoregressive steps
+per frame. The trainer restores the best validation checkpoint, reports
+teacher-within-frame and free-within-frame accuracy, records coarse accuracy by
+utterance-position quartile, and writes numbered ground-truth, teacher, and
+free audio under `checkpoints/moss_grouped_hybrid11/audio`.
+
+| Architecture | Global planner | Local schedule | Local steps/frame | Expected result |
+|---|---|---|---:|---|
+| Original MOSS Local | Pretrained MOSS audio LM | One RVQ channel per step | 32 | Quality baseline; largest local compute |
+| First MiniMoss | Text-only Qwen2.5-0.5B LoRA | Eight adjacent groups of four | 8 | Fastest schedule, but failed alignment and produced collapsed audio |
+| Coarse-first student | Frozen pretrained MOSS audio LM | Codebooks 1-4 sequential, remaining channels grouped by four | 11 | About 2.9x fewer local AR steps with better coarse stability; quality and end-to-end speed still require measurement |
