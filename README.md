@@ -490,3 +490,46 @@ python -u -m minimoss.train_overfit \
 
 This command ends immediately after the `R2_PASS` or `R2_FAIL` decision and
 does not introduce group 3.
+
+### Stronger Dedicated R3 Gate
+
+After R2 passes, resume its best checkpoint rather than its final checkpoint.
+For an R2 best checkpoint saved at global step 875, run 750 additional steps
+through global step 1625. Groups 1 and 2 remain anchors while group 3 receives
+the stronger new-group weight:
+
+```bash
+python -u -m minimoss.train_overfit \
+  --manifest data_ljspeech_1100/train_manifest.jsonl \
+  --validation-manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir checkpoints/ljspeech_1000_r3_strong_b8 \
+  --batch-size 8 \
+  --max-steps 1625 \
+  --validate-every 125 \
+  --lr 5e-5 \
+  --qwen-lora \
+  --qwen-lora-rank 8 \
+  --qwen-lora-alpha 16 \
+  --nonlinear-frame-conditioner \
+  --frame-position-embedding \
+  --context-dropout-warmup-steps 5000 \
+  --context-dropout-decay-steps 0 \
+  --context-dropout-start 1.0 \
+  --context-dropout-end 1.0 \
+  --refinement-curriculum \
+  --refinement-start-group 3 \
+  --refinement-stage-steps 750 \
+  --refinement-anchor-weight 8 \
+  --refinement-existing-weight 2 \
+  --refinement-new-weight 4 \
+  --refinement-min-improvement 0.01 \
+  --refinement-max-g1-regression 0.03 \
+  --phase-gate-min-text-delta 0.005 \
+  --text-diagnostics \
+  --resume checkpoints/ljspeech_1000_r2_strong_b8/best_r2.pt \
+  --device cuda 2>&1 | tee logs/train_ljspeech_r3_strong_b8.log
+```
+
+This command evaluates only R3 and writes `best_r3.pt` when the new group
+improves without exceeding the group-1 regression gate.

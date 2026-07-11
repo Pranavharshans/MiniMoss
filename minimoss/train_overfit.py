@@ -59,11 +59,16 @@ def refinement_stage_and_weights(
     anchor_weight: float = 8.0,
     existing_weight: float = 2.0,
     new_weight: float = 1.0,
+    start_group: int = 2,
 ):
     """Introduce one refinement group per stage while strongly anchoring group 1."""
     if relative_step <= 0 or stage_steps <= 0:
         raise ValueError("relative_step and stage_steps must be positive")
-    introduced_group = min(2 + (relative_step - 1) // stage_steps, n_groups)
+    if not 2 <= start_group <= n_groups:
+        raise ValueError("start_group must be between 2 and n_groups")
+    introduced_group = min(
+        start_group + (relative_step - 1) // stage_steps, n_groups
+    )
     weights = [0.0] * n_groups
     weights[0] = anchor_weight
     for group in range(2, introduced_group):
@@ -202,6 +207,7 @@ def main():
     parser.add_argument("--refinement-anchor-weight", type=float, default=8.0)
     parser.add_argument("--refinement-existing-weight", type=float, default=2.0)
     parser.add_argument("--refinement-new-weight", type=float, default=1.0)
+    parser.add_argument("--refinement-start-group", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--codec", default="OpenMOSS-Team/MOSS-Audio-Tokenizer",
@@ -264,6 +270,8 @@ def main():
             raise ValueError("Refinement curriculum requires --resume from best_phase_a.pt")
         if args.refinement_stage_steps <= 0:
             raise ValueError("--refinement-stage-steps must be positive")
+        if not 2 <= args.refinement_start_group <= config.n_groups:
+            raise ValueError("--refinement-start-group must be between 2 and n_groups")
         if min(
             args.refinement_anchor_weight,
             args.refinement_existing_weight,
@@ -425,6 +433,7 @@ def main():
                 args.refinement_anchor_weight,
                 args.refinement_existing_weight,
                 args.refinement_new_weight,
+                args.refinement_start_group,
             )
         elif args.group_curriculum:
             phase, weights = curriculum_phase_and_weights(

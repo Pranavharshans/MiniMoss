@@ -70,6 +70,20 @@ def test_refinement_curriculum_supports_stronger_new_group_gate():
     assert weights == (8.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
+def test_refinement_curriculum_can_resume_at_group_three():
+    phase, weights, group = refinement_stage_and_weights(
+        750,
+        750,
+        anchor_weight=8.0,
+        existing_weight=2.0,
+        new_weight=4.0,
+        start_group=3,
+    )
+
+    assert (phase, group) == ("R3", 3)
+    assert weights == (8.0, 2.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
 def test_per_codebook_losses_respect_frame_mask():
     logits = [torch.zeros((1, 2, 4)), torch.zeros((1, 2, 4))]
     targets = torch.tensor([[[0, 1], [3, 2]]])
