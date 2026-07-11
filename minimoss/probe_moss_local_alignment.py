@@ -45,9 +45,9 @@ def extract_item(model, processor, item, token_dir: Path, device: str):
             f"states={states.shape[0]}, prefixes={prefix_tokens.shape[0]}"
         )
     return (
-        states.float(),
-        targets.long(),
-        prefix_tokens.long(),
+        states.float().cpu(),
+        targets.long().cpu(),
+        prefix_tokens.long().cpu(),
     )
 
 
