@@ -607,6 +607,8 @@ python -u -m minimoss.validate_moss_teacher \
 Run the original 32-step MOSS local decoder over those states and cache its
 top-32 logits plus argmax tokens. Listen to the numbered teacher audio before
 training the student; it must reproduce normal speech from the cached states.
+The `teacher_topk_sampled` file is an independent top-k sampling diagnostic,
+not a sequential on-policy MOSS rollout.
 
 ```bash
 python -u -m minimoss.extract_moss_teacher_targets \
@@ -640,11 +642,91 @@ codebooks 5-32 in seven groups of four. This is 11 local autoregressive steps
 per frame. The trainer restores the best validation checkpoint and reports
 teacher-within-frame accuracy, free-within-frame accuracy, teacher agreement,
 and coarse accuracy by utterance-position quartile. It writes numbered
-ground-truth, original-teacher, student-teacher, and student-free audio under
-`checkpoints/moss_grouped_hybrid11_distilled/audio`.
+ground-truth, original-teacher-greedy, student-teacher, student-free, and
+student-sampled audio under `checkpoints/moss_grouped_hybrid11_distilled/audio`.
 
 | Architecture | Global planner | Local schedule | Local steps/frame | Expected result |
 |---|---|---|---:|---|
 | Original MOSS Local | Pretrained MOSS audio LM | One RVQ channel per step | 32 | Quality baseline; largest local compute |
 | First MiniMoss | Text-only Qwen2.5-0.5B LoRA | Eight adjacent groups of four | 8 | Fastest schedule, but failed alignment and produced collapsed audio |
 | Coarse-first student | Frozen pretrained MOSS audio LM | Codebooks 1-4 sequential, remaining channels grouped by four | 11 | About 2.9x fewer local AR steps with better coarse stability; quality and end-to-end speed still require measurement |
+
+### Five-Variant Experiment Matrix
+
+The grouped student trainer contains five presets that use the same cached MOSS
+states and the same validation split. This makes the comparison useful: only
+the loss objective, grouping schedule, or local capacity changes. Run each
+command independently; each writes to its own directory.
+
+```bash
+python -u -m minimoss.train_grouped_student \
+  --variant baseline11 \
+  --train-cache evaluation/moss_teacher_distillation/train_distill.pt \
+  --validation-cache evaluation/moss_teacher_distillation/validation_distill.pt \
+  --output-dir checkpoints/moss_experiments/baseline11 \
+  --batch-size 512 --eval-batch-size 1024 --max-steps 5000 \
+  --validate-every 100 --audio-limit 10 --device cuda \
+  2>&1 | tee logs/moss_experiment_baseline11.log
+```
+
+```bash
+python -u -m minimoss.train_grouped_student \
+  --variant gt_only11 \
+  --train-cache evaluation/moss_teacher_distillation/train_distill.pt \
+  --validation-cache evaluation/moss_teacher_distillation/validation_distill.pt \
+  --output-dir checkpoints/moss_experiments/gt_only11 \
+  --batch-size 512 --eval-batch-size 1024 --max-steps 5000 \
+  --validate-every 100 --audio-limit 10 --device cuda \
+  2>&1 | tee logs/moss_experiment_gt_only11.log
+```
+
+```bash
+python -u -m minimoss.train_grouped_student \
+  --variant kd_only11 \
+  --train-cache evaluation/moss_teacher_distillation/train_distill.pt \
+  --validation-cache evaluation/moss_teacher_distillation/validation_distill.pt \
+  --output-dir checkpoints/moss_experiments/kd_only11 \
+  --batch-size 512 --eval-batch-size 1024 --max-steps 5000 \
+  --validate-every 100 --audio-limit 10 --device cuda \
+  2>&1 | tee logs/moss_experiment_kd_only11.log
+```
+
+```bash
+python -u -m minimoss.train_grouped_student \
+  --variant adjacent16 \
+  --train-cache evaluation/moss_teacher_distillation/train_distill.pt \
+  --validation-cache evaluation/moss_teacher_distillation/validation_distill.pt \
+  --output-dir checkpoints/moss_experiments/adjacent16 \
+  --batch-size 512 --eval-batch-size 1024 --max-steps 5000 \
+  --validate-every 100 --audio-limit 10 --device cuda \
+  2>&1 | tee logs/moss_experiment_adjacent16.log
+```
+
+```bash
+python -u -m minimoss.train_grouped_student \
+  --variant large11 \
+  --train-cache evaluation/moss_teacher_distillation/train_distill.pt \
+  --validation-cache evaluation/moss_teacher_distillation/validation_distill.pt \
+  --output-dir checkpoints/moss_experiments/large11 \
+  --batch-size 512 --eval-batch-size 1024 --max-steps 5000 \
+  --validate-every 100 --audio-limit 10 --device cuda \
+  2>&1 | tee logs/moss_experiment_large11.log
+```
+
+After any subset or all five runs finish, collect the numeric comparison and
+audio locations with:
+
+```bash
+python -u -m minimoss.summarize_experiments \
+  --root checkpoints/moss_experiments \
+  --output evaluation/moss_experiments_summary.json
+```
+
+`baseline11` is the current 43.5M hybrid. `gt_only11` tests whether teacher
+distillation is hurting. `kd_only11` tests whether the student can imitate the
+official local teacher without the raw target objective. `adjacent16` trades
+speed for a less aggressive grouping schedule. `large11` tests whether the
+current failure is capacity-limited; it is roughly 90M parameters. Select a
+candidate using free-running audio first, then free token accuracy and teacher
+agreement as diagnostics. Weighted validation losses from the three objective
+variants are not directly comparable.

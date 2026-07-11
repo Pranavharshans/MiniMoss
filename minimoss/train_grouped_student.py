@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the coarse-first grouped local student from cached MOSS states."""
+"""Train a configured grouped local student from cached MOSS states."""
 
 import argparse
 import copy
@@ -11,7 +11,12 @@ import torch
 import torchaudio
 
 from .codec import AudioCodec
-from .grouped_student import GroupedLocalStudent, GroupedStudentConfig
+from .grouped_student import (
+    EXPERIMENT_SPECS,
+    GroupedLocalStudent,
+    GroupedStudentConfig,
+    get_experiment_spec,
+)
 from .utils import set_seed
 
 
@@ -133,7 +138,16 @@ def final_metrics(
 
 
 @torch.inference_mode()
-def save_audio_examples(model, cache, output_dir: Path, codec_name: str, device: str, limit: int):
+def save_audio_examples(
+    model,
+    cache,
+    output_dir: Path,
+    codec_name: str,
+    device: str,
+    limit: int,
+    temperature: float,
+    top_k: int,
+):
     codec = AudioCodec(model_name=codec_name, n_quantizers=32)
     if hasattr(codec.model, "to"):
         codec.model.to(device)
@@ -145,12 +159,22 @@ def save_audio_examples(model, cache, output_dir: Path, codec_name: str, device:
         targets = item["rvq"].long().to(device)
         teacher = model.predict(states, teacher_targets=targets)
         free = model.predict(states)
+        sampled = model.predict(states, temperature=temperature, top_k=top_k)
         outputs = [
             ("ground_truth", targets),
-            ("original_teacher", item["teacher_tokens"].long().to(device)),
+            ("original_teacher_greedy", item["teacher_tokens"].long().to(device)),
             ("student_teacher", teacher),
             ("student_free", free),
+            ("student_sampled", sampled),
         ]
+        if "teacher_sampled_tokens" in item:
+            outputs.insert(
+                2,
+                (
+                    "original_teacher_topk_sampled",
+                    item["teacher_sampled_tokens"].long().to(device),
+                ),
+            )
         for name, codes in outputs:
             waveform = codec.decode(codes.transpose(0, 1).unsqueeze(0))[0].cpu()
             torchaudio.save(
@@ -165,6 +189,12 @@ def save_audio_examples(model, cache, output_dir: Path, codec_name: str, device:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--variant",
+        choices=tuple(EXPERIMENT_SPECS),
+        default="baseline11",
+        help="Controlled experiment preset; explicit numeric flags override its defaults",
+    )
     parser.add_argument("--train-cache", required=True)
     parser.add_argument("--validation-cache", required=True)
     parser.add_argument("--output-dir", default="checkpoints/moss_grouped_hybrid11")
@@ -173,24 +203,54 @@ def main():
     parser.add_argument("--eval-batch-size", type=int, default=1024)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
-    parser.add_argument("--label-smoothing", type=float, default=0.02)
-    parser.add_argument("--ground-truth-weight", type=float, default=0.5)
-    parser.add_argument("--distillation-weight", type=float, default=0.5)
+    parser.add_argument("--label-smoothing", type=float, default=None)
+    parser.add_argument("--ground-truth-weight", type=float, default=None)
+    parser.add_argument("--distillation-weight", type=float, default=None)
     parser.add_argument("--distillation-temperature", type=float, default=2.0)
     parser.add_argument("--validate-every", type=int, default=100)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--min-delta", type=float, default=0.005)
-    parser.add_argument("--local-hidden-size", type=int, default=512)
-    parser.add_argument("--local-layers", type=int, default=4)
-    parser.add_argument("--local-ffn-size", type=int, default=1024)
+    parser.add_argument("--local-hidden-size", type=int, default=None)
+    parser.add_argument("--local-layers", type=int, default=None)
+    parser.add_argument("--local-ffn-size", type=int, default=None)
     parser.add_argument("--local-dropout", type=float, default=0.1)
     parser.add_argument("--audio-limit", type=int, default=10)
+    parser.add_argument("--audio-temperature", type=float, default=1.0)
+    parser.add_argument("--audio-top-k", type=int, default=25)
+    parser.add_argument("--skip-audio", action="store_true")
     parser.add_argument("--codec", default="OpenMOSS-Team/MOSS-Audio-Tokenizer")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     if min(args.max_steps, args.batch_size, args.validate_every, args.patience) <= 0:
         raise ValueError("Training steps, batch size, validation interval, and patience must be positive")
+    spec = get_experiment_spec(args.variant)
+    ground_truth_weight = (
+        spec["ground_truth_weight"]
+        if args.ground_truth_weight is None
+        else args.ground_truth_weight
+    )
+    distillation_weight = (
+        spec["distillation_weight"]
+        if args.distillation_weight is None
+        else args.distillation_weight
+    )
+    label_smoothing = (
+        spec["label_smoothing"]
+        if args.label_smoothing is None
+        else args.label_smoothing
+    )
+    local_hidden_size = (
+        spec["local_hidden_size"]
+        if args.local_hidden_size is None
+        else args.local_hidden_size
+    )
+    local_layers = spec["local_num_layers"] if args.local_layers is None else args.local_layers
+    local_ffn_size = (
+        spec["local_ffn_hidden_size"]
+        if args.local_ffn_size is None
+        else args.local_ffn_size
+    )
     set_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -216,16 +276,17 @@ def main():
         raise ValueError(
             "Distillation caches must contain teacher_topk_indices and teacher_topk_values"
         )
-    if args.ground_truth_weight < 0 or args.distillation_weight < 0:
+    if ground_truth_weight < 0 or distillation_weight < 0:
         raise ValueError("Loss weights cannot be negative")
-    if args.ground_truth_weight + args.distillation_weight <= 0:
+    if ground_truth_weight + distillation_weight <= 0:
         raise ValueError("At least one loss weight must be positive")
     config = GroupedStudentConfig(
         global_hidden_size=train_states.shape[1],
-        local_hidden_size=args.local_hidden_size,
-        local_num_layers=args.local_layers,
-        local_ffn_hidden_size=args.local_ffn_size,
+        local_hidden_size=local_hidden_size,
+        local_num_layers=local_layers,
+        local_ffn_hidden_size=local_ffn_size,
         local_dropout=args.local_dropout,
+        groups=spec["groups"],
     )
     model = GroupedLocalStudent(config).to(args.device)
     optimizer = torch.optim.AdamW(
@@ -234,11 +295,18 @@ def main():
     scaler = torch.amp.GradScaler("cuda") if args.device.startswith("cuda") else None
     generator = torch.Generator().manual_seed(args.seed)
     trainable = sum(parameter.numel() for parameter in model.parameters())
+    print(f"experiment: {args.variant} | {spec['description']}")
     print(f"train frames: {train_states.shape[0]} | validation frames: {validation_states.shape[0]}")
-    print(f"student parameters: {trainable:,} | local steps/frame: {len(config.groups)}")
+    print(
+        f"student parameters: {trainable:,} | local steps/frame: {len(config.groups)} | "
+        f"gt_weight={ground_truth_weight} | kd_weight={distillation_weight}"
+    )
     best_loss = float("inf")
     best_step = 0
     best_state = None
+    best_validation_ground_truth_loss = None
+    best_validation_distillation_loss = None
+    best_validation_channel_losses = None
     checks_without_improvement = 0
     for step in range(1, args.max_steps + 1):
         started = time.time()
@@ -258,10 +326,10 @@ def main():
                     targets,
                     teacher_indices,
                     teacher_values,
-                    args.ground_truth_weight,
-                    args.distillation_weight,
+                    ground_truth_weight,
+                    distillation_weight,
                     args.distillation_temperature,
-                    args.label_smoothing,
+                    label_smoothing,
                 )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -274,10 +342,10 @@ def main():
                 targets,
                 teacher_indices,
                 teacher_values,
-                args.ground_truth_weight,
-                args.distillation_weight,
+                ground_truth_weight,
+                distillation_weight,
                 args.distillation_temperature,
-                args.label_smoothing,
+                label_smoothing,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -297,8 +365,8 @@ def main():
                 validation_teacher_values,
                 args.device,
                 args.eval_batch_size,
-                args.ground_truth_weight,
-                args.distillation_weight,
+                ground_truth_weight,
+                distillation_weight,
                 args.distillation_temperature,
             )
             print(
@@ -311,10 +379,14 @@ def main():
                 best_loss = val_loss
                 best_step = step
                 best_state = copy.deepcopy(model.state_dict())
+                best_validation_ground_truth_loss = val_gt
+                best_validation_distillation_loss = val_kd
+                best_validation_channel_losses = channel_losses
                 checks_without_improvement = 0
                 torch.save({
                     "model_state_dict": best_state,
                     "config": config.to_dict(),
+                    "variant": args.variant,
                     "step": step,
                     "validation_loss": val_loss,
                 }, output_dir / "best.pt")
@@ -328,10 +400,23 @@ def main():
         raise RuntimeError("No validation checkpoint was produced")
     model.load_state_dict(best_state)
     metrics = {
+        "experiment": args.variant,
+        "description": spec["description"],
         "best_step": best_step,
         "best_validation_loss": best_loss,
+        "best_validation_ground_truth_loss": best_validation_ground_truth_loss,
+        "best_validation_distillation_loss": best_validation_distillation_loss,
+        "best_validation_channel_losses": best_validation_channel_losses,
         "student_parameters": trainable,
         "local_steps_per_frame": len(config.groups),
+        "groups": [list(group) for group in config.groups],
+        "ground_truth_weight": ground_truth_weight,
+        "distillation_weight": distillation_weight,
+        "distillation_temperature": args.distillation_temperature,
+        "label_smoothing": label_smoothing,
+        "local_hidden_size": local_hidden_size,
+        "local_layers": local_layers,
+        "local_ffn_size": local_ffn_size,
         **final_metrics(
             model,
             validation_states,
@@ -344,9 +429,19 @@ def main():
     }
     (output_dir / "summary.json").write_text(json.dumps(metrics, indent=2) + "\n")
     print(json.dumps(metrics, indent=2))
-    save_audio_examples(
-        model, validation_cache, output_dir, args.codec, args.device, args.audio_limit
-    )
+    if not args.skip_audio and args.audio_limit > 0:
+        save_audio_examples(
+            model,
+            validation_cache,
+            output_dir,
+            args.codec,
+            args.device,
+            args.audio_limit,
+            args.audio_temperature,
+            args.audio_top_k,
+        )
+    else:
+        print("Audio generation skipped")
     print(f"Outputs: {output_dir}")
 
 

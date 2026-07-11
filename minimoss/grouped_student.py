@@ -23,6 +23,74 @@ COARSE_FIRST_GROUPS = (
     (28, 29, 30, 31),
 )
 
+ADJACENT2_GROUPS = tuple(
+    tuple(range(start, start + 2)) for start in range(0, 32, 2)
+)
+
+
+# These variants intentionally share the same model and cache contracts. The
+# matrix isolates training objective, grouping schedule, and local capacity.
+EXPERIMENT_SPECS = {
+    "baseline11": {
+        "description": "43.5M coarse-first student with equal target and teacher losses",
+        "groups": COARSE_FIRST_GROUPS,
+        "local_hidden_size": 512,
+        "local_num_layers": 4,
+        "local_ffn_hidden_size": 1024,
+        "ground_truth_weight": 0.5,
+        "distillation_weight": 0.5,
+        "label_smoothing": 0.02,
+    },
+    "gt_only11": {
+        "description": "Coarse-first student trained only on ground-truth RVQ targets",
+        "groups": COARSE_FIRST_GROUPS,
+        "local_hidden_size": 512,
+        "local_num_layers": 4,
+        "local_ffn_hidden_size": 1024,
+        "ground_truth_weight": 1.0,
+        "distillation_weight": 0.0,
+        "label_smoothing": 0.0,
+    },
+    "kd_only11": {
+        "description": "Coarse-first student trained only to match the official local teacher",
+        "groups": COARSE_FIRST_GROUPS,
+        "local_hidden_size": 512,
+        "local_num_layers": 4,
+        "local_ffn_hidden_size": 1024,
+        "ground_truth_weight": 0.0,
+        "distillation_weight": 1.0,
+        "label_smoothing": 0.0,
+    },
+    "adjacent16": {
+        "description": "43.5M student with 16 adjacent pairs per frame",
+        "groups": ADJACENT2_GROUPS,
+        "local_hidden_size": 512,
+        "local_num_layers": 4,
+        "local_ffn_hidden_size": 1024,
+        "ground_truth_weight": 0.5,
+        "distillation_weight": 0.5,
+        "label_smoothing": 0.02,
+    },
+    "large11": {
+        "description": "Higher-capacity coarse-first student for the 40M-capacity hypothesis",
+        "groups": COARSE_FIRST_GROUPS,
+        "local_hidden_size": 768,
+        "local_num_layers": 6,
+        "local_ffn_hidden_size": 2048,
+        "ground_truth_weight": 0.5,
+        "distillation_weight": 0.5,
+        "label_smoothing": 0.02,
+    },
+}
+
+
+def get_experiment_spec(name: str):
+    try:
+        return dict(EXPERIMENT_SPECS[name])
+    except KeyError as exc:
+        choices = ", ".join(EXPERIMENT_SPECS)
+        raise ValueError(f"Unknown experiment {name!r}; choose from {choices}") from exc
+
 
 @dataclass
 class GroupedStudentConfig:
@@ -166,7 +234,13 @@ class GroupedLocalStudent(nn.Module):
         return total, ground_truth_loss, teacher_loss, channel_losses
 
     @torch.inference_mode()
-    def predict(self, global_states: torch.Tensor, teacher_targets=None):
+    def predict(
+        self,
+        global_states: torch.Tensor,
+        teacher_targets=None,
+        temperature: float = 0.0,
+        top_k: int = 0,
+    ):
         """Predict all codebooks, optionally conditioning on ground-truth prior groups."""
         inputs = [self.global_projection(global_states)]
         predictions = torch.zeros(
@@ -179,7 +253,19 @@ class GroupedLocalStudent(nn.Module):
             positions = torch.arange(len(inputs), device=decoder_input.device).unsqueeze(0)
             hidden = self.local_decoder(decoder_input, position_ids=positions)[:, -1]
             for codebook in group:
-                predictions[:, codebook] = self.output_heads[codebook](hidden).argmax(-1)
+                logits = self.output_heads[codebook](hidden)
+                if temperature <= 0:
+                    token = logits.argmax(-1)
+                else:
+                    if top_k > 0:
+                        values, indices = logits.topk(min(top_k, logits.shape[-1]), dim=-1)
+                        probabilities = F.softmax(values.float() / temperature, dim=-1)
+                        offsets = torch.multinomial(probabilities, 1)
+                        token = indices.gather(-1, offsets).squeeze(-1)
+                    else:
+                        probabilities = F.softmax(logits.float() / temperature, dim=-1)
+                        token = torch.multinomial(probabilities, 1).squeeze(-1)
+                predictions[:, codebook] = token
             if group_index + 1 < len(self.config.groups):
                 context = teacher_targets if teacher_targets is not None else predictions
                 inputs.append(self.embed_group(context, group))

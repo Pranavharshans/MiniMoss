@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from minimoss.extract_moss_teacher_targets import original_local_logits
+from minimoss.extract_moss_teacher_targets import original_local_logits, sample_topk
 
 
 class IdentityLocal(nn.Module):
@@ -39,3 +39,12 @@ def test_original_local_logits_align_audio_heads_after_text_channel():
 
     assert len(logits) == 4
     assert all(channel.shape == (3, 8) for channel in logits)
+
+
+def test_topk_sampling_returns_only_candidate_indices():
+    indices = torch.tensor([[[4, 7]]])
+    values = torch.tensor([[[100.0, -100.0]]])
+
+    sampled = sample_topk(indices, values, temperature=1.0)
+
+    assert sampled.tolist() == [[4]]

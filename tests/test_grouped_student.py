@@ -2,9 +2,12 @@ import pytest
 import torch
 
 from minimoss.grouped_student import (
+    ADJACENT2_GROUPS,
     COARSE_FIRST_GROUPS,
+    EXPERIMENT_SPECS,
     GroupedLocalStudent,
     GroupedStudentConfig,
+    get_experiment_spec,
 )
 
 
@@ -25,6 +28,27 @@ def tiny_config():
 def test_coarse_first_layout_has_eleven_steps_and_all_codebooks():
     assert len(COARSE_FIRST_GROUPS) == 11
     assert [codebook for group in COARSE_FIRST_GROUPS for codebook in group] == list(range(32))
+
+
+def test_experiment_matrix_has_five_valid_layouts():
+    assert set(EXPERIMENT_SPECS) == {
+        "baseline11",
+        "gt_only11",
+        "kd_only11",
+        "adjacent16",
+        "large11",
+    }
+    assert len(ADJACENT2_GROUPS) == 16
+    for name in EXPERIMENT_SPECS:
+        spec = get_experiment_spec(name)
+        flattened = [codebook for group in spec["groups"] for codebook in group]
+        assert flattened == list(range(32))
+        assert spec["ground_truth_weight"] + spec["distillation_weight"] > 0
+
+
+def test_unknown_experiment_has_actionable_error():
+    with pytest.raises(ValueError, match="choose from"):
+        get_experiment_spec("does_not_exist")
 
 
 def test_grouped_student_forward_backward_and_prediction_modes():

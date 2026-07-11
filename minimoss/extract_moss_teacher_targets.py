@@ -48,7 +48,32 @@ def original_local_logits(model, global_states: torch.Tensor, rvq: torch.Tensor)
 
 
 @torch.inference_mode()
-def enrich_cache(model, cache, device: str, batch_size: int, top_k: int):
+def sample_topk(indices: torch.Tensor, values: torch.Tensor, temperature: float):
+    probabilities = torch.softmax(values.float() / temperature, dim=-1)
+    sampled_offsets = torch.multinomial(
+        probabilities.reshape(-1, probabilities.shape[-1]), 1
+    ).reshape(indices.shape[:-1] + (1,))
+    return indices.gather(-1, sampled_offsets).squeeze(-1)
+
+
+def add_sampled_tokens(cache, temperature: float):
+    for item in cache:
+        item["teacher_sampled_tokens"] = sample_topk(
+            item["teacher_topk_indices"].long(),
+            item["teacher_topk_values"].float(),
+            temperature,
+        ).to(dtype=torch.int16)
+    return cache
+
+
+def enrich_cache(
+    model,
+    cache,
+    device: str,
+    batch_size: int,
+    top_k: int,
+    sampling_temperature: float,
+):
     enriched = []
     for item_index, item in enumerate(cache, start=1):
         states = item["states"].to(device=device, dtype=model.dtype)
@@ -56,6 +81,7 @@ def enrich_cache(model, cache, device: str, batch_size: int, top_k: int):
         indices_parts = []
         values_parts = []
         tokens_parts = []
+        sampled_parts = []
         for start in range(0, states.shape[0], batch_size):
             logits = original_local_logits(
                 model,
@@ -67,11 +93,17 @@ def enrich_cache(model, cache, device: str, batch_size: int, top_k: int):
             indices_parts.append(indices.to(dtype=torch.int16, device="cpu"))
             values_parts.append(values.to(dtype=torch.float16, device="cpu"))
             tokens_parts.append(stacked.argmax(dim=-1).to(dtype=torch.int16, device="cpu"))
+            sampled_parts.append(
+                sample_topk(indices, values, sampling_temperature).to(
+                    dtype=torch.int16, device="cpu"
+                )
+            )
         enriched.append({
             **item,
             "teacher_topk_indices": torch.cat(indices_parts),
             "teacher_topk_values": torch.cat(values_parts),
             "teacher_tokens": torch.cat(tokens_parts),
+            "teacher_sampled_tokens": torch.cat(sampled_parts),
         })
         print(
             f"[{item_index:04d}/{len(cache):04d}] {item['id']} | "
@@ -89,7 +121,8 @@ def save_teacher_audio(cache, output_dir: Path, codec_name: str, device: str, li
     for index, item in enumerate(cache[:limit], start=1):
         for name, codes in (
             ("ground_truth", item["rvq"].long()),
-            ("teacher", item["teacher_tokens"].long()),
+            ("teacher_greedy", item["teacher_tokens"].long()),
+            ("teacher_topk_sampled", item["teacher_sampled_tokens"].long()),
         ):
             waveform = codec.decode(
                 codes.transpose(0, 1).unsqueeze(0).to(device)
@@ -114,40 +147,71 @@ def main():
     parser.add_argument("--top-k", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--audio-limit", type=int, default=10)
+    parser.add_argument("--sampling-temperature", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--reuse-topk", action="store_true")
     parser.add_argument("--codec", default="OpenMOSS-Team/MOSS-Audio-Tokenizer")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     if not 0 < args.top_k <= 1024:
         raise ValueError("--top-k must be in [1, 1024]")
+    if args.sampling_temperature <= 0:
+        raise ValueError("--sampling-temperature must be positive")
+    torch.manual_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    train_cache = torch.load(args.train_cache, map_location="cpu", weights_only=True)
-    validation_cache = torch.load(
-        args.validation_cache, map_location="cpu", weights_only=True
-    )
-    dtype = torch.bfloat16 if args.device.startswith("cuda") else torch.float32
-    print(f"Loading original MOSS local teacher: {args.model}@{args.revision}")
-    model = AutoModel.from_pretrained(
-        args.model,
-        revision=args.revision,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-    ).to(args.device)
-    model.eval()
-    print("Extracting training teacher targets...")
-    train_enriched = enrich_cache(
-        model, train_cache, args.device, args.batch_size, args.top_k
-    )
-    torch.save(train_enriched, output_dir / "train_distill.pt")
-    print("Extracting validation teacher targets...")
-    validation_enriched = enrich_cache(
-        model, validation_cache, args.device, args.batch_size, args.top_k
-    )
-    torch.save(validation_enriched, output_dir / "validation_distill.pt")
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    train_output = output_dir / "train_distill.pt"
+    validation_output = output_dir / "validation_distill.pt"
+    if args.reuse_topk:
+        if not train_output.exists() or not validation_output.exists():
+            raise FileNotFoundError("--reuse-topk requires existing distillation caches")
+        print("Reusing cached top-k teacher logits")
+        train_enriched = add_sampled_tokens(
+            torch.load(train_output, map_location="cpu", weights_only=True),
+            args.sampling_temperature,
+        )
+        validation_enriched = add_sampled_tokens(
+            torch.load(validation_output, map_location="cpu", weights_only=True),
+            args.sampling_temperature,
+        )
+    else:
+        train_cache = torch.load(args.train_cache, map_location="cpu", weights_only=True)
+        validation_cache = torch.load(
+            args.validation_cache, map_location="cpu", weights_only=True
+        )
+        dtype = torch.bfloat16 if args.device.startswith("cuda") else torch.float32
+        print(f"Loading original MOSS local teacher: {args.model}@{args.revision}")
+        model = AutoModel.from_pretrained(
+            args.model,
+            revision=args.revision,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+        ).to(args.device)
+        model.eval()
+        print("Extracting training teacher targets...")
+        train_enriched = enrich_cache(
+            model,
+            train_cache,
+            args.device,
+            args.batch_size,
+            args.top_k,
+            args.sampling_temperature,
+        )
+        print("Extracting validation teacher targets...")
+        validation_enriched = enrich_cache(
+            model,
+            validation_cache,
+            args.device,
+            args.batch_size,
+            args.top_k,
+            args.sampling_temperature,
+        )
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    torch.save(train_enriched, train_output)
+    torch.save(validation_enriched, validation_output)
     save_teacher_audio(
         validation_enriched,
         output_dir,
