@@ -42,6 +42,29 @@ def test_grouped_student_forward_backward_and_prediction_modes():
     assert model.global_projection[1].weight.grad is not None
 
 
+def test_topk_distillation_loss_backpropagates():
+    model = GroupedLocalStudent(tiny_config())
+    states = torch.randn(5, 12)
+    targets = torch.randint(0, 8, (5, 4))
+    teacher_indices = torch.randint(0, 8, (5, 4, 3))
+    teacher_values = torch.randn(5, 4, 3)
+
+    total, ground_truth, distillation, _ = model.combined_loss(
+        states,
+        targets,
+        teacher_indices,
+        teacher_values,
+        ground_truth_weight=0.5,
+        distillation_weight=0.5,
+        temperature=2.0,
+    )
+    total.backward()
+
+    assert torch.isfinite(ground_truth)
+    assert torch.isfinite(distillation)
+    assert model.output_heads[0].weight.grad is not None
+
+
 def test_group_layout_rejects_missing_or_reordered_codebooks():
     with pytest.raises(ValueError, match="cover every codebook"):
         GroupedStudentConfig(global_hidden_size=12, n_codebooks=4, groups=((0,), (2, 3)))

@@ -119,6 +119,52 @@ class GroupedLocalStudent(nn.Module):
         ]
         return torch.stack(losses).mean(), losses
 
+    def distillation_loss(
+        self,
+        logits,
+        teacher_indices: torch.Tensor,
+        teacher_values: torch.Tensor,
+        temperature: float = 1.0,
+    ):
+        student = torch.stack(logits, dim=1)
+        teacher_probabilities = F.softmax(
+            teacher_values.float() / temperature, dim=-1
+        )
+        student_log_probabilities = F.log_softmax(
+            student.float() / temperature, dim=-1
+        )
+        selected = student_log_probabilities.gather(
+            dim=-1, index=teacher_indices.long()
+        )
+        return -(teacher_probabilities * selected).sum(dim=-1).mean() * temperature ** 2
+
+    def combined_loss(
+        self,
+        global_states,
+        targets,
+        teacher_indices,
+        teacher_values,
+        ground_truth_weight: float,
+        distillation_weight: float,
+        temperature: float,
+        label_smoothing: float = 0.0,
+    ):
+        logits = self.teacher_logits(global_states, targets)
+        channel_losses = [
+            F.cross_entropy(
+                logits[codebook],
+                targets[:, codebook],
+                label_smoothing=label_smoothing,
+            )
+            for codebook in range(self.config.n_codebooks)
+        ]
+        ground_truth_loss = torch.stack(channel_losses).mean()
+        teacher_loss = self.distillation_loss(
+            logits, teacher_indices, teacher_values, temperature
+        )
+        total = ground_truth_weight * ground_truth_loss + distillation_weight * teacher_loss
+        return total, ground_truth_loss, teacher_loss, channel_losses
+
     @torch.inference_mode()
     def predict(self, global_states: torch.Tensor, teacher_targets=None):
         """Predict all codebooks, optionally conditioning on ground-truth prior groups."""

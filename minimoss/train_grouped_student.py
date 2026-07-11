@@ -29,24 +29,61 @@ def flatten_cache(cache):
         torch.arange(item["rvq"].shape[0]).float() / max(item["rvq"].shape[0] - 1, 1)
         for item in cache
     ])
-    return states, targets, positions
+    teacher_indices = None
+    teacher_values = None
+    teacher_tokens = None
+    if "teacher_topk_indices" in cache[0]:
+        teacher_indices = torch.cat([item["teacher_topk_indices"] for item in cache]).long()
+        teacher_values = torch.cat([item["teacher_topk_values"] for item in cache]).float()
+        teacher_tokens = torch.cat([item["teacher_tokens"] for item in cache]).long()
+    return states, targets, positions, teacher_indices, teacher_values, teacher_tokens
 
 
 @torch.inference_mode()
-def validation_loss(model, states, targets, device: str, batch_size: int):
+def validation_loss(
+    model,
+    states,
+    targets,
+    teacher_indices,
+    teacher_values,
+    device: str,
+    batch_size: int,
+    ground_truth_weight: float,
+    distillation_weight: float,
+    temperature: float,
+):
     model.eval()
     total = 0.0
     count = 0
     channel_totals = torch.zeros(model.config.n_codebooks)
+    ground_truth_total = 0.0
+    distillation_total = 0.0
     for start in range(0, states.shape[0], batch_size):
         batch_states = states[start:start + batch_size].to(device)
         batch_targets = targets[start:start + batch_size].to(device)
-        loss, channel_losses = model.loss(batch_states, batch_targets)
+        batch_indices = teacher_indices[start:start + batch_size].to(device)
+        batch_values = teacher_values[start:start + batch_size].to(device)
+        loss, ground_truth_loss, teacher_loss, channel_losses = model.combined_loss(
+            batch_states,
+            batch_targets,
+            batch_indices,
+            batch_values,
+            ground_truth_weight,
+            distillation_weight,
+            temperature,
+        )
         size = batch_states.shape[0]
         total += float(loss) * size
+        ground_truth_total += float(ground_truth_loss) * size
+        distillation_total += float(teacher_loss) * size
         channel_totals += torch.tensor([float(value) for value in channel_losses]) * size
         count += size
-    return total / count, (channel_totals / count).tolist()
+    return (
+        total / count,
+        ground_truth_total / count,
+        distillation_total / count,
+        (channel_totals / count).tolist(),
+    )
 
 
 def group_accuracies(predictions, targets, groups):
@@ -57,7 +94,9 @@ def group_accuracies(predictions, targets, groups):
 
 
 @torch.inference_mode()
-def final_metrics(model, states, targets, positions, device: str, batch_size: int):
+def final_metrics(
+    model, states, targets, positions, teacher_tokens, device: str, batch_size: int
+):
     model.eval()
     teacher_parts = []
     free_parts = []
@@ -73,13 +112,24 @@ def final_metrics(model, states, targets, positions, device: str, batch_size: in
     for lower in (0.0, 0.25, 0.5, 0.75):
         mask = (positions >= lower) & (positions <= lower + 0.25 if lower == 0.75 else positions < lower + 0.25)
         position_accuracy.append(float(coarse_matches[mask].mean()))
-    return {
+    metrics = {
         "teacher_token_accuracy": float(teacher.eq(targets).float().mean()),
         "free_token_accuracy": float(free.eq(targets).float().mean()),
         "teacher_group_accuracy": group_accuracies(teacher, targets, model.config.groups),
         "free_group_accuracy": group_accuracies(free, targets, model.config.groups),
         "free_coarse_accuracy_by_position_quartile": position_accuracy,
     }
+    if teacher_tokens is not None:
+        metrics["teacher_original_token_accuracy"] = float(
+            teacher_tokens.eq(targets).float().mean()
+        )
+        metrics["student_teacher_agreement"] = float(
+            teacher.eq(teacher_tokens).float().mean()
+        )
+        metrics["student_free_teacher_agreement"] = float(
+            free.eq(teacher_tokens).float().mean()
+        )
+    return metrics
 
 
 @torch.inference_mode()
@@ -95,7 +145,13 @@ def save_audio_examples(model, cache, output_dir: Path, codec_name: str, device:
         targets = item["rvq"].long().to(device)
         teacher = model.predict(states, teacher_targets=targets)
         free = model.predict(states)
-        for name, codes in (("ground_truth", targets), ("teacher", teacher), ("free", free)):
+        outputs = [
+            ("ground_truth", targets),
+            ("original_teacher", item["teacher_tokens"].long().to(device)),
+            ("student_teacher", teacher),
+            ("student_free", free),
+        ]
+        for name, codes in outputs:
             waveform = codec.decode(codes.transpose(0, 1).unsqueeze(0))[0].cpu()
             torchaudio.save(
                 str(audio_dir / f"{index:02d}_{name}.wav"),
@@ -118,6 +174,9 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--label-smoothing", type=float, default=0.02)
+    parser.add_argument("--ground-truth-weight", type=float, default=0.5)
+    parser.add_argument("--distillation-weight", type=float, default=0.5)
+    parser.add_argument("--distillation-temperature", type=float, default=2.0)
     parser.add_argument("--validate-every", type=int, default=100)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--min-delta", type=float, default=0.005)
@@ -137,8 +196,30 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     train_cache = load_cache(args.train_cache)
     validation_cache = load_cache(args.validation_cache)
-    train_states, train_targets, _ = flatten_cache(train_cache)
-    validation_states, validation_targets, validation_positions = flatten_cache(validation_cache)
+    (
+        train_states,
+        train_targets,
+        _,
+        train_teacher_indices,
+        train_teacher_values,
+        _,
+    ) = flatten_cache(train_cache)
+    (
+        validation_states,
+        validation_targets,
+        validation_positions,
+        validation_teacher_indices,
+        validation_teacher_values,
+        validation_teacher_tokens,
+    ) = flatten_cache(validation_cache)
+    if train_teacher_indices is None or validation_teacher_indices is None:
+        raise ValueError(
+            "Distillation caches must contain teacher_topk_indices and teacher_topk_values"
+        )
+    if args.ground_truth_weight < 0 or args.distillation_weight < 0:
+        raise ValueError("Loss weights cannot be negative")
+    if args.ground_truth_weight + args.distillation_weight <= 0:
+        raise ValueError("At least one loss weight must be positive")
     config = GroupedStudentConfig(
         global_hidden_size=train_states.shape[1],
         local_hidden_size=args.local_hidden_size,
@@ -166,29 +247,63 @@ def main():
         )
         states = train_states[indices].to(args.device)
         targets = train_targets[indices].to(args.device)
+        teacher_indices = train_teacher_indices[indices].to(args.device)
+        teacher_values = train_teacher_values[indices].to(args.device)
         model.train()
         optimizer.zero_grad()
         if scaler is not None:
             with torch.amp.autocast("cuda"):
-                loss, _ = model.loss(states, targets, args.label_smoothing)
+                loss, ground_truth_loss, teacher_loss, _ = model.combined_loss(
+                    states,
+                    targets,
+                    teacher_indices,
+                    teacher_values,
+                    args.ground_truth_weight,
+                    args.distillation_weight,
+                    args.distillation_temperature,
+                    args.label_smoothing,
+                )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
-            loss, _ = model.loss(states, targets, args.label_smoothing)
+            loss, ground_truth_loss, teacher_loss, _ = model.combined_loss(
+                states,
+                targets,
+                teacher_indices,
+                teacher_values,
+                args.ground_truth_weight,
+                args.distillation_weight,
+                args.distillation_temperature,
+                args.label_smoothing,
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
         if step == 1 or step % 20 == 0:
-            print(f"step={step} | loss={loss.item():.4f} | t={time.time() - started:.2f}s")
+            print(
+                f"step={step} | loss={loss.item():.4f} | "
+                f"gt={ground_truth_loss.item():.4f} | "
+                f"kd={teacher_loss.item():.4f} | t={time.time() - started:.2f}s"
+            )
         if step % args.validate_every == 0:
-            val_loss, channel_losses = validation_loss(
-                model, validation_states, validation_targets, args.device, args.eval_batch_size
+            val_loss, val_gt, val_kd, channel_losses = validation_loss(
+                model,
+                validation_states,
+                validation_targets,
+                validation_teacher_indices,
+                validation_teacher_values,
+                args.device,
+                args.eval_batch_size,
+                args.ground_truth_weight,
+                args.distillation_weight,
+                args.distillation_temperature,
             )
             print(
                 f"validation step={step} | loss={val_loss:.4f} | "
+                f"gt={val_gt:.4f} | kd={val_kd:.4f} | "
                 f"cb1={channel_losses[0]:.4f} | cb4={channel_losses[3]:.4f} | "
                 f"cb32={channel_losses[-1]:.4f}"
             )
@@ -222,6 +337,7 @@ def main():
             validation_states,
             validation_targets,
             validation_positions,
+            validation_teacher_tokens,
             args.device,
             args.eval_batch_size,
         ),

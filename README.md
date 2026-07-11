@@ -604,25 +604,44 @@ python -u -m minimoss.validate_moss_teacher \
   --device cuda 2>&1 | tee logs/extract_moss_teacher_states_1000.log
 ```
 
-Train the 43.5M-parameter coarse-first student from those cached states:
+Run the original 32-step MOSS local decoder over those states and cache its
+top-32 logits plus argmax tokens. Listen to the numbered teacher audio before
+training the student; it must reproduce normal speech from the cached states.
+
+```bash
+python -u -m minimoss.extract_moss_teacher_targets \
+  --train-cache evaluation/moss_teacher_states_1000/train_states.pt \
+  --validation-cache evaluation/moss_teacher_states_1000/validation_states.pt \
+  --output-dir evaluation/moss_teacher_distillation \
+  --top-k 32 \
+  --batch-size 128 \
+  --device cuda 2>&1 | tee logs/extract_moss_teacher_targets.log
+```
+
+Train the 43.5M-parameter coarse-first student from the enriched distillation
+caches:
 
 ```bash
 python -u -m minimoss.train_grouped_student \
-  --train-cache evaluation/moss_teacher_states_1000/train_states.pt \
-  --validation-cache evaluation/moss_teacher_states_1000/validation_states.pt \
-  --output-dir checkpoints/moss_grouped_hybrid11 \
+  --train-cache evaluation/moss_teacher_distillation/train_distill.pt \
+  --validation-cache evaluation/moss_teacher_distillation/validation_distill.pt \
+  --output-dir checkpoints/moss_grouped_hybrid11_distilled \
   --batch-size 512 \
   --max-steps 5000 \
   --validate-every 100 \
-  --device cuda 2>&1 | tee logs/train_moss_grouped_hybrid11.log
+  --ground-truth-weight 0.5 \
+  --distillation-weight 0.5 \
+  --distillation-temperature 2.0 \
+  --device cuda 2>&1 | tee logs/train_moss_grouped_hybrid11_distilled.log
 ```
 
 The student predicts codebooks 1-4 in four sequential steps, then predicts
 codebooks 5-32 in seven groups of four. This is 11 local autoregressive steps
-per frame. The trainer restores the best validation checkpoint, reports
-teacher-within-frame and free-within-frame accuracy, records coarse accuracy by
-utterance-position quartile, and writes numbered ground-truth, teacher, and
-free audio under `checkpoints/moss_grouped_hybrid11/audio`.
+per frame. The trainer restores the best validation checkpoint and reports
+teacher-within-frame accuracy, free-within-frame accuracy, teacher agreement,
+and coarse accuracy by utterance-position quartile. It writes numbered
+ground-truth, original-teacher, student-teacher, and student-free audio under
+`checkpoints/moss_grouped_hybrid11_distilled/audio`.
 
 | Architecture | Global planner | Local schedule | Local steps/frame | Expected result |
 |---|---|---|---:|---|
