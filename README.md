@@ -538,3 +538,31 @@ Each dedicated refinement run evaluates its resume checkpoint before the first
 optimizer step. The printed `refinement baseline` is the loss used by the stage
 gate; the first trained validation point is eligible to become the best stage
 checkpoint.
+
+## Official MOSS Global-State Gate
+
+Before replacing the failed text-only Qwen frame conditioner, validate that the
+released MOSS global backbone provides useful acoustic frame states. This test
+first generates three untouched official-MOSS controls. It then caches global
+states for 200 training and 20 held-out utterances, trains a small probe for
+RVQ codebooks 1-4, and writes hybrid audio with predicted codebooks 1-4 plus
+ground-truth codebooks 5-32.
+
+```bash
+python -u -m minimoss.validate_moss_teacher \
+  --train-manifest data_ljspeech_1100/train_manifest.jsonl \
+  --validation-manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir evaluation/moss_teacher_probe \
+  --train-limit 200 \
+  --validation-limit 20 \
+  --probe-steps 2000 \
+  --device cuda 2>&1 | tee logs/validate_moss_teacher.log
+```
+
+Listen to `official_control/*_official_moss.wav` first. If those files are not
+normal speech, stop and fix the official model runtime. If they are good,
+inspect `summary.json` and then listen to
+`hybrid_audio/*_predicted_cb01-04.wav`. The planner gate passes only when probe
+validation loss beats both unigram and uniform baselines and most hybrid files
+remain intelligible.
