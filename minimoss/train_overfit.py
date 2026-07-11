@@ -52,16 +52,23 @@ def curriculum_phase_and_weights(step: int, phase_a_end: int, phase_b_end: int):
     return "C", (4.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
 
-def refinement_stage_and_weights(relative_step: int, stage_steps: int, n_groups: int = 8):
+def refinement_stage_and_weights(
+    relative_step: int,
+    stage_steps: int,
+    n_groups: int = 8,
+    anchor_weight: float = 8.0,
+    existing_weight: float = 2.0,
+    new_weight: float = 1.0,
+):
     """Introduce one refinement group per stage while strongly anchoring group 1."""
     if relative_step <= 0 or stage_steps <= 0:
         raise ValueError("relative_step and stage_steps must be positive")
     introduced_group = min(2 + (relative_step - 1) // stage_steps, n_groups)
     weights = [0.0] * n_groups
-    weights[0] = 8.0
+    weights[0] = anchor_weight
     for group in range(2, introduced_group):
-        weights[group - 1] = 2.0
-    weights[introduced_group - 1] = 1.0
+        weights[group - 1] = existing_weight
+    weights[introduced_group - 1] = new_weight
     return f"R{introduced_group}", tuple(weights), introduced_group
 
 
@@ -192,6 +199,9 @@ def main():
     parser.add_argument("--refinement-stage-steps", type=int, default=375)
     parser.add_argument("--refinement-min-improvement", type=float, default=0.01)
     parser.add_argument("--refinement-max-g1-regression", type=float, default=0.03)
+    parser.add_argument("--refinement-anchor-weight", type=float, default=8.0)
+    parser.add_argument("--refinement-existing-weight", type=float, default=2.0)
+    parser.add_argument("--refinement-new-weight", type=float, default=1.0)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--codec", default="OpenMOSS-Team/MOSS-Audio-Tokenizer",
@@ -254,6 +264,12 @@ def main():
             raise ValueError("Refinement curriculum requires --resume from best_phase_a.pt")
         if args.refinement_stage_steps <= 0:
             raise ValueError("--refinement-stage-steps must be positive")
+        if min(
+            args.refinement_anchor_weight,
+            args.refinement_existing_weight,
+            args.refinement_new_weight,
+        ) <= 0:
+            raise ValueError("Refinement weights must be positive")
         if args.refinement_stage_steps % args.validate_every:
             raise ValueError("Refinement stage length must be divisible by --validate-every")
         if not args.text_diagnostics:
@@ -403,7 +419,12 @@ def main():
         if args.refinement_curriculum:
             relative_step = step - start_step
             phase, weights, introduced_group = refinement_stage_and_weights(
-                relative_step, args.refinement_stage_steps, config.n_groups
+                relative_step,
+                args.refinement_stage_steps,
+                config.n_groups,
+                args.refinement_anchor_weight,
+                args.refinement_existing_weight,
+                args.refinement_new_weight,
             )
         elif args.group_curriculum:
             phase, weights = curriculum_phase_and_weights(

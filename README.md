@@ -448,3 +448,45 @@ The trainer writes `best_r2.pt` through `best_r8.pt`. A failed stage emits
 `R2_FAIL` through `R8_FAIL` and stops immediately. Previous-frame context stays
 fully hidden throughout V5; restoring temporal context is a separate gate only
 after all refinement groups generalize.
+
+### Stronger Dedicated R2 Gate
+
+If the default 375-step R2 stage preserves group 1 but undertrains group 2,
+restart from the same phase-A checkpoint with twice the duration, a 4x new-group
+weight, and learning rate `5e-5`. For a phase-A checkpoint at step 625, 750
+additional steps end at global step 1375:
+
+```bash
+python -u -m minimoss.train_overfit \
+  --manifest data_ljspeech_1100/train_manifest.jsonl \
+  --validation-manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir checkpoints/ljspeech_1000_r2_strong_b8 \
+  --batch-size 8 \
+  --max-steps 1375 \
+  --validate-every 125 \
+  --lr 5e-5 \
+  --qwen-lora \
+  --qwen-lora-rank 8 \
+  --qwen-lora-alpha 16 \
+  --nonlinear-frame-conditioner \
+  --frame-position-embedding \
+  --context-dropout-warmup-steps 5000 \
+  --context-dropout-decay-steps 0 \
+  --context-dropout-start 1.0 \
+  --context-dropout-end 1.0 \
+  --refinement-curriculum \
+  --refinement-stage-steps 750 \
+  --refinement-anchor-weight 8 \
+  --refinement-existing-weight 2 \
+  --refinement-new-weight 4 \
+  --refinement-min-improvement 0.01 \
+  --refinement-max-g1-regression 0.03 \
+  --phase-gate-min-text-delta 0.005 \
+  --text-diagnostics \
+  --resume checkpoints/ljspeech_1000_v4_b8/best_phase_a.pt \
+  --device cuda 2>&1 | tee logs/train_ljspeech_r2_strong_b8.log
+```
+
+This command ends immediately after the `R2_PASS` or `R2_FAIL` decision and
+does not introduce group 3.
