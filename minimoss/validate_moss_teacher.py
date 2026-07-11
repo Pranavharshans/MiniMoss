@@ -279,11 +279,11 @@ def main():
 
     dtype = torch.bfloat16 if args.device.startswith("cuda") else torch.float32
     print(f"Loading official MOSS teacher: {args.model}")
-    processor = AutoProcessor.from_pretrained(
-        args.model,
-        revision=args.revision,
-        trust_remote_code=True,
-    )
+    # The custom processor forwards all kwargs to the separate audio-tokenizer
+    # repository, so passing the TTS revision here incorrectly applies that
+    # commit hash to the codec as well. Pin the TTS model below; the processor
+    # resolves the model's declared code and codec revisions independently.
+    processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModel.from_pretrained(
         args.model,
         revision=args.revision,
