@@ -41,6 +41,18 @@ def test_original_local_logits_align_audio_heads_after_text_channel():
     assert all(channel.shape == (3, 8) for channel in logits)
 
 
+def test_original_local_logits_accepts_per_frame_prefix_tokens():
+    teacher = FakeTeacher()
+    states = torch.randn(3, 6)
+    targets = torch.randint(0, 8, (3, 4))
+    prefixes = torch.tensor([1, 2, 3])
+
+    logits = original_local_logits(teacher, states, targets, prefixes)
+
+    assert len(logits) == 4
+    assert all(channel.shape == (3, 8) for channel in logits)
+
+
 def test_topk_sampling_returns_only_candidate_indices():
     indices = torch.tensor([[[4, 7]]])
     values = torch.tensor([[[100.0, -100.0]]])

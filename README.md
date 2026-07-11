@@ -610,6 +610,48 @@ training the student; it must reproduce normal speech from the cached states.
 The `teacher_topk_sampled` file is an independent top-k sampling diagnostic,
 not a sequential on-policy MOSS rollout.
 
+### Local Decoder Alignment Probe
+
+Before retraining the student, test whether the fixed channel-0 slot token was
+causing the noisy teacher. The probe compares the old fixed prefix against the
+actual per-frame channel-0 prefix and writes numbered audio for both paths.
+
+```bash
+python -u -m minimoss.probe_moss_local_alignment \
+  --manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir evaluation/moss_local_alignment \
+  --limit 3 --max-frames 64 --audio-limit 3 \
+  --device cuda 2>&1 | tee logs/probe_moss_local_alignment.log
+```
+
+If the observed-prefix loss is lower and its audio is cleaner, regenerate the
+state caches without `--reuse-cache`; the extractor now stores the aligned
+`local_prefix_tokens` needed by the local teacher:
+
+```bash
+python -u -m minimoss.validate_moss_teacher \
+  --train-manifest data_ljspeech_1100/train_manifest.jsonl \
+  --validation-manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir evaluation/moss_teacher_states_aligned \
+  --train-limit 1000 --validation-limit 100 --control-limit 1 \
+  --control-max-new-tokens 128 --extract-only --device cuda \
+  2>&1 | tee logs/extract_moss_teacher_states_aligned.log
+```
+
+Then regenerate local-teacher targets into a new directory and point the
+student experiments at those new files:
+
+```bash
+python -u -m minimoss.extract_moss_teacher_targets \
+  --train-cache evaluation/moss_teacher_states_aligned/train_states.pt \
+  --validation-cache evaluation/moss_teacher_states_aligned/validation_states.pt \
+  --output-dir evaluation/moss_teacher_distillation_aligned \
+  --top-k 32 --batch-size 128 --device cuda \
+  2>&1 | tee logs/extract_moss_teacher_targets_aligned.log
+```
+
 ```bash
 python -u -m minimoss.extract_moss_teacher_targets \
   --train-cache evaluation/moss_teacher_states_1000/train_states.pt \

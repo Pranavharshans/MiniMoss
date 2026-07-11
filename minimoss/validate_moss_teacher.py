@@ -109,6 +109,7 @@ def extract_split(model, processor, items, token_dir: Path, device: str):
         )
         states = outputs.last_hidden_state[valid_mask]
         audio_targets = targets[..., 1:][valid_mask]
+        local_prefix_tokens = targets[..., 0][valid_mask]
         if states.shape[0] != rvq.shape[0]:
             raise RuntimeError(
                 f"{item['id']}: extracted {states.shape[0]} states for "
@@ -119,6 +120,11 @@ def extract_split(model, processor, items, token_dir: Path, device: str):
             "text": item["text"],
             "states": states.to(dtype=torch.float16, device="cpu"),
             "rvq": audio_targets.to(dtype=torch.int16, device="cpu"),
+            # The official local decoder conditions its first depth step on
+            # this channel-0 token; it is not necessarily a fixed slot token.
+            "local_prefix_tokens": local_prefix_tokens.to(
+                dtype=torch.int16, device="cpu"
+            ),
         })
         print(f"[{index:03d}/{len(items):03d}] {item['id']} | {states.shape[0]} frames")
     return utterances

@@ -13,16 +13,28 @@ from .codec import AudioCodec
 from .validate_moss_teacher import DEFAULT_MODEL, DEFAULT_REVISION
 
 
-def original_local_logits(model, global_states: torch.Tensor, rvq: torch.Tensor):
+def original_local_logits(
+    model,
+    global_states: torch.Tensor,
+    rvq: torch.Tensor,
+    prefix_tokens: torch.Tensor | None = None,
+):
     """Run the original MOSS local decoder under within-frame teacher forcing."""
     batch = global_states.shape[0]
-    text_code = torch.full(
-        (batch,),
-        model.config.audio_assistant_gen_slot_token_id,
-        dtype=torch.long,
-        device=global_states.device,
-    )
-    local_inputs = [global_states, model.model.embedding_list[0](text_code)]
+    if prefix_tokens is None:
+        prefix_tokens = torch.full(
+            (batch,),
+            model.config.audio_assistant_gen_slot_token_id,
+            dtype=torch.long,
+            device=global_states.device,
+        )
+    else:
+        prefix_tokens = prefix_tokens.to(device=global_states.device, dtype=torch.long)
+        if prefix_tokens.shape != (batch,):
+            raise ValueError(
+                f"prefix_tokens must have shape {(batch,)}, got {tuple(prefix_tokens.shape)}"
+            )
+    local_inputs = [global_states, model.model.embedding_list[0](prefix_tokens)]
     for codebook in range(model.config.n_vq - 1):
         local_inputs.append(
             model.model.embedding_list[codebook + 1](rvq[:, codebook])
@@ -78,6 +90,9 @@ def enrich_cache(
     for item_index, item in enumerate(cache, start=1):
         states = item["states"].to(device=device, dtype=model.dtype)
         targets = item["rvq"].to(device=device, dtype=torch.long)
+        prefix_tokens = item.get("local_prefix_tokens")
+        if prefix_tokens is not None:
+            prefix_tokens = prefix_tokens.to(device=device, dtype=torch.long)
         indices_parts = []
         values_parts = []
         tokens_parts = []
@@ -87,6 +102,9 @@ def enrich_cache(
                 model,
                 states[start:start + batch_size],
                 targets[start:start + batch_size],
+                None
+                if prefix_tokens is None
+                else prefix_tokens[start:start + batch_size],
             )
             stacked = torch.stack(logits, dim=1)
             values, indices = stacked.topk(top_k, dim=-1)
