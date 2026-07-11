@@ -533,3 +533,8 @@ python -u -m minimoss.train_overfit \
 
 This command evaluates only R3 and writes `best_r3.pt` when the new group
 improves without exceeding the group-1 regression gate.
+
+Each dedicated refinement run evaluates its resume checkpoint before the first
+optimizer step. The printed `refinement baseline` is the loss used by the stage
+gate; the first trained validation point is eligible to become the best stage
+checkpoint.

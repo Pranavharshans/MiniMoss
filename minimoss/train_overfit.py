@@ -266,6 +266,8 @@ def main():
     if args.refinement_curriculum:
         if args.group_curriculum:
             raise ValueError("Choose either group or refinement curriculum, not both")
+        if not args.validation_manifest:
+            raise ValueError("Refinement curriculum requires --validation-manifest")
         if args.resume is None:
             raise ValueError("Refinement curriculum requires --resume from best_phase_a.pt")
         if args.refinement_stage_steps <= 0:
@@ -409,6 +411,33 @@ def main():
 
     if start_step >= total_steps:
         raise ValueError(f"Resume step {start_step} is already at or beyond max steps {total_steps}")
+
+    if args.refinement_curriculum:
+        baseline_phase, baseline_weights, baseline_group = refinement_stage_and_weights(
+            1,
+            args.refinement_stage_steps,
+            config.n_groups,
+            args.refinement_anchor_weight,
+            args.refinement_existing_weight,
+            args.refinement_new_weight,
+            args.refinement_start_group,
+        )
+        _, baseline_groups, _ = validate(
+            model,
+            validation_loader,
+            args.device,
+            baseline_weights,
+            args.validation_batches,
+            audio_context_dropout_prob=1.0,
+        )
+        refinement_g1_baseline = baseline_groups[0]
+        refinement_initial_losses[baseline_phase] = baseline_groups[baseline_group - 1]
+        print(
+            f"refinement baseline step={start_step} | phase={baseline_phase} | "
+            f"g1={refinement_g1_baseline:.4f} | "
+            f"g{baseline_group}={refinement_initial_losses[baseline_phase]:.4f}"
+        )
+
     print(f"\nTraining from step {start_step + 1} through {total_steps}...\n")
 
     # Create iterator once, recreate on exhaustion
