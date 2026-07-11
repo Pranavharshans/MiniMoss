@@ -52,6 +52,19 @@ def curriculum_phase_and_weights(step: int, phase_a_end: int, phase_b_end: int):
     return "C", (4.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
 
+def refinement_stage_and_weights(relative_step: int, stage_steps: int, n_groups: int = 8):
+    """Introduce one refinement group per stage while strongly anchoring group 1."""
+    if relative_step <= 0 or stage_steps <= 0:
+        raise ValueError("relative_step and stage_steps must be positive")
+    introduced_group = min(2 + (relative_step - 1) // stage_steps, n_groups)
+    weights = [0.0] * n_groups
+    weights[0] = 8.0
+    for group in range(2, introduced_group):
+        weights[group - 1] = 2.0
+    weights[introduced_group - 1] = 1.0
+    return f"R{introduced_group}", tuple(weights), introduced_group
+
+
 def per_codebook_losses(logits, audio_codes, audio_frame_mask, codebook_size):
     losses = []
     for codebook, codebook_logits in enumerate(logits):
@@ -175,6 +188,10 @@ def main():
     parser.add_argument("--phase-b-end", type=int, default=1500)
     parser.add_argument("--phase-gate-min-improvement", type=float, default=0.02)
     parser.add_argument("--phase-gate-min-text-delta", type=float, default=0.005)
+    parser.add_argument("--refinement-curriculum", action="store_true")
+    parser.add_argument("--refinement-stage-steps", type=int, default=375)
+    parser.add_argument("--refinement-min-improvement", type=float, default=0.01)
+    parser.add_argument("--refinement-max-g1-regression", type=float, default=0.03)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--codec", default="OpenMOSS-Team/MOSS-Audio-Tokenizer",
@@ -230,6 +247,17 @@ def main():
             raise ValueError("Phase boundaries must be divisible by --validate-every")
         if not args.text_diagnostics:
             raise ValueError("Group curriculum requires --text-diagnostics")
+    if args.refinement_curriculum:
+        if args.group_curriculum:
+            raise ValueError("Choose either group or refinement curriculum, not both")
+        if args.resume is None:
+            raise ValueError("Refinement curriculum requires --resume from best_phase_a.pt")
+        if args.refinement_stage_steps <= 0:
+            raise ValueError("--refinement-stage-steps must be positive")
+        if args.refinement_stage_steps % args.validate_every:
+            raise ValueError("Refinement stage length must be divisible by --validate-every")
+        if not args.text_diagnostics:
+            raise ValueError("Refinement curriculum requires --text-diagnostics")
 
     print("=" * 60)
     print("MiniMoss Overfit Training")
@@ -258,6 +286,10 @@ def main():
     print(
         f"  group_curriculum: {args.group_curriculum} "
         f"(A<= {args.phase_a_end}, B<= {args.phase_b_end})"
+    )
+    print(
+        f"  refinement_curriculum: {args.refinement_curriculum} "
+        f"(stage_steps={args.refinement_stage_steps})"
     )
 
     # Dataset
@@ -317,11 +349,18 @@ def main():
     validation_checks_without_improvement = 0
     phase_best_losses = {"A": float("inf"), "B": float("inf"), "C": float("inf")}
     phase_initial_losses = {}
+    refinement_initial_losses = {}
+    refinement_best_losses = {}
+    refinement_best_g1 = {}
+    refinement_best_text_delta = {}
+    refinement_g1_baseline = None
     if args.resume:
         print(f"Resuming from: {args.resume}")
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = config.learning_rate
         if scaler is not None and checkpoint.get("scaler_state_dict") is not None:
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
         start_step = int(checkpoint["step"])
@@ -361,12 +400,19 @@ def main():
             args.context_dropout_start,
             args.context_dropout_end,
         )
-        if args.group_curriculum:
+        if args.refinement_curriculum:
+            relative_step = step - start_step
+            phase, weights, introduced_group = refinement_stage_and_weights(
+                relative_step, args.refinement_stage_steps, config.n_groups
+            )
+        elif args.group_curriculum:
             phase, weights = curriculum_phase_and_weights(
                 step, args.phase_a_end, args.phase_b_end
             )
+            introduced_group = None
         else:
             phase, weights = "standard", config.group_loss_weights
+            introduced_group = None
 
         if args.overfit_one_batch:
             text_input, mask_input = text_batch, mask_batch
@@ -434,9 +480,10 @@ def main():
             )
 
         if validation_loader is not None and step % args.validate_every == 0:
-            validation_context_dropout = (
-                1.0 if args.group_curriculum and phase in ("A", "B") else 0.0
-            )
+            validation_context_dropout = 1.0 if (
+                args.refinement_curriculum
+                or (args.group_curriculum and phase in ("A", "B"))
+            ) else 0.0
             validation_loss, validation_groups, validation_codebooks = validate(
                 model,
                 validation_loader,
@@ -468,7 +515,10 @@ def main():
                 )
                 print(f"  -> new best phase {phase} checkpoint: {phase_path}")
 
-            tracks_final_metric = not args.group_curriculum or phase == "C"
+            tracks_final_metric = (
+                (not args.group_curriculum and not args.refinement_curriculum)
+                or phase in ("C", "R8")
+            )
             if tracks_final_metric and validation_loss < best_validation_loss:
                 best_validation_loss = validation_loss
                 validation_checks_without_improvement = 0
@@ -516,6 +566,61 @@ def main():
                     f"alternate={alternate_context_loss:.4f} | "
                     f"delta={alternate_context_loss - validation_loss:.4f}"
                 )
+
+                if args.refinement_curriculum:
+                    new_group_index = introduced_group - 1
+                    new_group_loss = validation_groups[new_group_index]
+                    group1_loss = validation_groups[0]
+                    group1_text_delta = shuffled_groups[0] - group1_loss
+                    if refinement_g1_baseline is None:
+                        refinement_g1_baseline = group1_loss
+                    refinement_initial_losses.setdefault(phase, new_group_loss)
+                    best_new_loss = refinement_best_losses.get(phase, float("inf"))
+                    g1_regression = group1_loss - refinement_g1_baseline
+                    if (
+                        new_group_loss < best_new_loss
+                        and g1_regression <= args.refinement_max_g1_regression
+                    ):
+                        refinement_best_losses[phase] = new_group_loss
+                        refinement_best_g1[phase] = group1_loss
+                        refinement_best_text_delta[phase] = group1_text_delta
+                        refinement_path = Path(args.output_dir) / f"best_{phase.lower()}.pt"
+                        save_checkpoint(
+                            refinement_path,
+                            step,
+                            model,
+                            optimizer,
+                            scaler,
+                            config,
+                            new_group_loss,
+                        )
+                        print(
+                            f"  -> new best refinement {phase} checkpoint: "
+                            f"{refinement_path}"
+                        )
+
+                    if relative_step % args.refinement_stage_steps == 0:
+                        best_loss = refinement_best_losses.get(phase, float("inf"))
+                        improvement = refinement_initial_losses[phase] - best_loss
+                        best_g1_loss = refinement_best_g1.get(phase, float("inf"))
+                        best_g1_regression = best_g1_loss - refinement_g1_baseline
+                        best_text_delta = refinement_best_text_delta.get(phase, 0.0)
+                        passed = (
+                            improvement >= args.refinement_min_improvement
+                            and best_g1_regression <= args.refinement_max_g1_regression
+                            and best_text_delta >= args.phase_gate_min_text_delta
+                        )
+                        print(
+                            f"{phase}_{'PASS' if passed else 'FAIL'} | "
+                            f"new_group_improvement={improvement:.4f} "
+                            f"(required={args.refinement_min_improvement:.4f}) | "
+                            f"g1_regression={best_g1_regression:.4f} "
+                            f"(max={args.refinement_max_g1_regression:.4f}) | "
+                            f"g1_text_delta={best_text_delta:.4f}"
+                        )
+                        if not passed:
+                            print(f"Stopping because refinement stage {phase} failed.")
+                            break
 
                 if args.group_curriculum and step in (args.phase_a_end, args.phase_b_end):
                     improvement = phase_initial_losses[phase] - phase_best_losses[phase]

@@ -393,3 +393,58 @@ phase's best checkpoint, not necessarily its final boundary value. To continue
 an earlier V4 run that stopped at the step-750 phase-A boundary, resume its
 `final.pt` with the same V4 arguments and the corrected `0.02` threshold; step
 751 enters phase B directly.
+
+## V5 One-Group Refinement Ladder
+
+Use V5 when V4 phase A establishes strong coarse text conditioning but phase B
+fails after introducing groups 2-4 simultaneously. V5 resumes the best phase-A
+checkpoint and introduces exactly one refinement group every 375 steps:
+
+```text
+R2: 8,1,0,0,0,0,0,0
+R3: 8,2,1,0,0,0,0,0
+...
+R8: 8,2,2,2,2,2,2,1
+```
+
+Each stage must improve its newly introduced group by at least `0.01`, preserve
+group-1 validation within `0.03` of the refinement baseline, and retain a
+positive group-1 shuffled-text delta. The resumed optimizer learning rate is
+explicitly replaced with the new `3e-5` rate instead of inheriting V4's
+`1e-4`.
+
+For a V4 `best_phase_a.pt` saved at step 625, run through global step 3250:
+
+```bash
+python -u -m minimoss.train_overfit \
+  --manifest data_ljspeech_1100/train_manifest.jsonl \
+  --validation-manifest data_ljspeech_1100/validation_manifest.jsonl \
+  --token-dir data_ljspeech_1100/tokens \
+  --output-dir checkpoints/ljspeech_1000_v5_b8 \
+  --batch-size 8 \
+  --max-steps 3250 \
+  --validate-every 125 \
+  --lr 3e-5 \
+  --qwen-lora \
+  --qwen-lora-rank 8 \
+  --qwen-lora-alpha 16 \
+  --nonlinear-frame-conditioner \
+  --frame-position-embedding \
+  --context-dropout-warmup-steps 5000 \
+  --context-dropout-decay-steps 0 \
+  --context-dropout-start 1.0 \
+  --context-dropout-end 1.0 \
+  --refinement-curriculum \
+  --refinement-stage-steps 375 \
+  --refinement-min-improvement 0.01 \
+  --refinement-max-g1-regression 0.03 \
+  --phase-gate-min-text-delta 0.005 \
+  --text-diagnostics \
+  --resume checkpoints/ljspeech_1000_v4_b8/best_phase_a.pt \
+  --device cuda 2>&1 | tee logs/train_ljspeech_1000_v5_b8.log
+```
+
+The trainer writes `best_r2.pt` through `best_r8.pt`. A failed stage emits
+`R2_FAIL` through `R8_FAIL` and stops immediately. Previous-frame context stays
+fully hidden throughout V5; restoring temporal context is a separate gate only
+after all refinement groups generalize.

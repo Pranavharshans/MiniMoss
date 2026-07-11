@@ -5,6 +5,7 @@ from minimoss.train_overfit import (
     context_dropout_for_step,
     curriculum_phase_and_weights,
     per_codebook_losses,
+    refinement_stage_and_weights,
 )
 
 
@@ -41,6 +42,19 @@ def test_phase_gate_best_improvement_uses_best_not_boundary_loss():
 
     assert initial_loss - best_loss > 0.02
     assert initial_loss - boundary_loss < 0.02
+
+
+def test_refinement_curriculum_introduces_one_group_at_a_time():
+    phase_r2, weights_r2, group_r2 = refinement_stage_and_weights(375, 375)
+    phase_r3, weights_r3, group_r3 = refinement_stage_and_weights(376, 375)
+    phase_r8, weights_r8, group_r8 = refinement_stage_and_weights(2625, 375)
+
+    assert (phase_r2, group_r2) == ("R2", 2)
+    assert weights_r2 == (8.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    assert (phase_r3, group_r3) == ("R3", 3)
+    assert weights_r3 == (8.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    assert (phase_r8, group_r8) == ("R8", 8)
+    assert weights_r8 == (8.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 1.0)
 
 
 def test_per_codebook_losses_respect_frame_mask():
